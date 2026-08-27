@@ -1,4 +1,4 @@
-# System Design Template
+# Notification System
 
 Spring Boot 기반 시스템 설계 프로젝트를 빠르게 시작하고,
 부하 테스트와 모니터링을 통해 설계 선택을 검증하기 위한 공통 템플릿입니다.
@@ -151,7 +151,7 @@ cp .env.example .env
 기본 설정:
 
 ```dotenv
-APP_NAME=system-design-template
+APP_NAME=notification-system
 
 APP_PORT=8080
 PROMETHEUS_PORT=9090

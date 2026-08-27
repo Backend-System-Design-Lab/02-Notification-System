@@ -1,4 +1,4 @@
-package com.backendsystemdesignlab.template.api;
+package com.backendsystemdesignlab.notification.api;
 
 public record PingResponse(String message) {
 

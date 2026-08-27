@@ -1,4 +1,4 @@
-package com.backendsystemdesignlab.template.api;
+package com.backendsystemdesignlab.notification.api;
 
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;

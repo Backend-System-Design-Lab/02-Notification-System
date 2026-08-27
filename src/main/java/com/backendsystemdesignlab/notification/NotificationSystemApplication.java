@@ -1,13 +1,13 @@
-package com.backendsystemdesignlab.template;
+package com.backendsystemdesignlab.notification;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 @SpringBootApplication
-public class SystemDesignTemplateApplication {
+public class NotificationSystemApplication {
 
 	public static void main(String[] args) {
-		SpringApplication.run(SystemDesignTemplateApplication.class, args);
+		SpringApplication.run(NotificationSystemApplication.class, args);
 	}
 
 }
