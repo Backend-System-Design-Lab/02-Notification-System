@@ -49,6 +49,35 @@ jobs:
           java --version
           ./gradlew --version
 
+      - name: Start MySQL
+        run: docker compose up -d mysql
+
+      - name: Wait for MySQL
+        run: |
+          for attempt in {1..30}; do
+            container_id="$(docker compose ps -q mysql)"
+
+            if [[ -n "$container_id" ]]; then
+              status="$(
+                docker inspect \
+                  --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+                  "$container_id"
+              )"
+
+              echo "Attempt ${attempt}: mysql health=${status}"
+
+              if [[ "$status" == "healthy" ]]; then
+                exit 0
+              fi
+            fi
+
+            sleep 2
+          done
+
+          echo "MySQL did not become healthy."
+          docker compose logs mysql
+          exit 1
+
       - name: Build and test
         run: ./gradlew clean build --no-daemon
 
