@@ -9,6 +9,16 @@ spring:
   main:
     keep-alive: true
 
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:mysql://localhost:3306/notification}
+    username: ${SPRING_DATASOURCE_USERNAME:notification}
+    password: ${SPRING_DATASOURCE_PASSWORD:notification}
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+
 management:
   endpoints:
     web:

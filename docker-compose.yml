@@ -12,6 +12,9 @@ services:
     environment:
       APP_NAME: ${APP_NAME:-notification-system}
       VIRTUAL_THREADS_ENABLED: ${VIRTUAL_THREADS_ENABLED:-false}
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/notification
+      SPRING_DATASOURCE_USERNAME: notification
+      SPRING_DATASOURCE_PASSWORD: notification
 
     healthcheck:
       test:
@@ -79,6 +82,24 @@ services:
       app:
         condition: service_healthy
 
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: notification
+      MYSQL_USER: notification
+      MYSQL_PASSWORD: notification
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   prometheus-data:
   grafana-data:
+  mysql-data:
