@@ -21,7 +21,7 @@ public class NotificationController {
     @PostMapping
     public ResponseEntity<SendNotificationResponse> send(@Valid @RequestBody SendNotificationRequest request) {
         SendNotificationResponse response = notificationService.send(request);
-        return ResponseEntity.accepted().body(response); // 아직 실제 전송이 완료된 게 아니라 요청 접수 단계 (202 Accepted)
+        return ResponseEntity.ok(response);
     }
 
 }
