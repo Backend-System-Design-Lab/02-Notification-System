@@ -1,9 +1,14 @@
 package com.backendsystemdesignlab.notification.notification.service;
 
+import com.backendsystemdesignlab.notification.notification.domain.DeliveryStatus;
 import com.backendsystemdesignlab.notification.notification.domain.Notification;
 import com.backendsystemdesignlab.notification.notification.domain.NotificationDelivery;
 import com.backendsystemdesignlab.notification.notification.dto.SendNotificationRequest;
 import com.backendsystemdesignlab.notification.notification.dto.SendNotificationResponse;
+import com.backendsystemdesignlab.notification.notification.provider.EmailProvider;
+import com.backendsystemdesignlab.notification.notification.provider.ProviderResult;
+import com.backendsystemdesignlab.notification.notification.provider.PushProvider;
+import com.backendsystemdesignlab.notification.notification.provider.SmsProvider;
 import com.backendsystemdesignlab.notification.notification.repository.NotificationDeliveryRepository;
 import com.backendsystemdesignlab.notification.notification.repository.NotificationRepository;
 import com.backendsystemdesignlab.notification.user.domain.NotificationChannel;
@@ -31,6 +36,10 @@ public class NotificationService {
     private final NotificationPreferenceRepository preferenceRepository;
     private final NotificationRepository notificationRepository;
     private final NotificationDeliveryRepository deliveryRepository;
+    private final PushProvider pushProvider;
+    private final SmsProvider smsProvider;
+    private final EmailProvider emailProvider;
+
 
     @Transactional
     public SendNotificationResponse send(SendNotificationRequest request) {
@@ -89,11 +98,43 @@ public class NotificationService {
 
         deliveryRepository.saveAll(deliveries);
 
+        notification.startProcessing();
+
+        sendDeliveries(deliveries);
+
+        boolean allSucceeded = deliveries.stream()
+                .allMatch(delivery -> delivery.getStatus() == DeliveryStatus.SENT);
+
+        if (allSucceeded) {
+            notification.complete();
+        } else {
+            notification.fail();
+        }
+
         return new SendNotificationResponse(
                 notification.getId(),
                 notification.getStatus(),
                 deliveries.size()
         );
+    }
+
+    private void sendDeliveries(List<NotificationDelivery> deliveries) {
+
+        for (NotificationDelivery delivery : deliveries) {
+            delivery.recordAttempt();
+
+            ProviderResult result = switch (delivery.getChannel()) {
+                case PUSH -> pushProvider.send(delivery.getDestination());
+                case SMS -> smsProvider.send(delivery.getDestination());
+                case EMAIL -> emailProvider.send(delivery.getDestination());
+            };
+
+            if (result.success()) {
+                delivery.markSent();
+            } else {
+                delivery.markFailed();
+            }
+        }
     }
 
     private void createPushDeliveries(User user, Notification notification, List<NotificationDelivery> deliveries) {
