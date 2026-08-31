@@ -101,15 +101,26 @@
 
 ## 9. Baseline 결과
 
-| 지표 | 결과 |
-|---|---:|
-| RPS |  |
-| p95 |  |
-| p99 |  |
-| Error Rate |  |
-| CPU |  |
-| Heap |  |
-| DB Query |  |
+### 동기식 Baseline
+
+Mock Provider는 Delivery당 100ms의 지연을 발생시키며,   
+Provider 호춣을 Notification API의 DB Transaction 내부에서 순차적으로 수행했다.
+
+| VU | RPS | Avg | p95 | p99 | Error Rate |
+|---:|---:|---:|---:|---:|---:|
+| 10 | 17.32 | 576ms | 892ms | - | 0% |
+| 30 | 22.09 | 1.33s | 2.13s | 2.57s | 0% |
+| 50 | 23.55 | 2.06s | 3.80s | 3.83s | 0% |
+
+30 VU 이상에서 HikariCP Active Connection이 최댓값인 10에 도달했다.
+30 VU에서는 약 20개, 50 VU에서는 약 40개의 요청이 Connection을 대기했다.
+
+동시 요청을 증가시켜도 처리량은 크게 증가하지 않았으며,    
+Connection 대기로 인해 응답 시간이 급격히 증가했다.
+
+원인은 DB Transaction 내부에서 외부 Provider를 동기 호출하여 외부 I/O 대기 시간 동안 DB Connection을 점유한 구조로 판단했다.
+
+<img src="./images/baseline.png">
 
 ## 10. 개선 내용
 
