@@ -1,177 +1,85 @@
 package com.backendsystemdesignlab.notification.notification.service;
 
-import com.backendsystemdesignlab.notification.notification.domain.DeliveryStatus;
-import com.backendsystemdesignlab.notification.notification.domain.Notification;
-import com.backendsystemdesignlab.notification.notification.domain.NotificationDelivery;
-import com.backendsystemdesignlab.notification.notification.dto.SendNotificationRequest;
-import com.backendsystemdesignlab.notification.notification.dto.SendNotificationResponse;
+import com.backendsystemdesignlab.notification.notification.domain.NotificationStatus;
+import com.backendsystemdesignlab.notification.notification.dto.*;
 import com.backendsystemdesignlab.notification.notification.provider.EmailProvider;
 import com.backendsystemdesignlab.notification.notification.provider.ProviderResult;
 import com.backendsystemdesignlab.notification.notification.provider.PushProvider;
 import com.backendsystemdesignlab.notification.notification.provider.SmsProvider;
-import com.backendsystemdesignlab.notification.notification.repository.NotificationDeliveryRepository;
-import com.backendsystemdesignlab.notification.notification.repository.NotificationRepository;
-import com.backendsystemdesignlab.notification.user.domain.NotificationChannel;
-import com.backendsystemdesignlab.notification.user.domain.NotificationPreference;
-import com.backendsystemdesignlab.notification.user.domain.User;
-import com.backendsystemdesignlab.notification.user.domain.UserDevice;
-import com.backendsystemdesignlab.notification.user.repository.NotificationPreferenceRepository;
-import com.backendsystemdesignlab.notification.user.repository.UserDeviceRepository;
-import com.backendsystemdesignlab.notification.user.repository.UserRepository;
+
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
-import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
 public class NotificationService {
 
-    private final UserRepository userRepository;
-    private final UserDeviceRepository userDeviceRepository;
-    private final NotificationPreferenceRepository preferenceRepository;
-    private final NotificationRepository notificationRepository;
-    private final NotificationDeliveryRepository deliveryRepository;
+    private final NotificationTransactionService transactionService;
+
     private final PushProvider pushProvider;
     private final SmsProvider smsProvider;
     private final EmailProvider emailProvider;
 
 
-    @Transactional
     public SendNotificationResponse send(SendNotificationRequest request) {
 
-        // 동일 eventId가 이미 처리된 경우 기존 결과 반환
-        var existing = notificationRepository.findByEventId(request.eventId());
+        // DB 작업
+        PreparedNotification prepared = transactionService.prepare(request);
 
-        if (existing.isPresent()) {
-            Notification notification = existing.get();
-
+        // 이미 처리했던 eventId
+        if (prepared.alreadyProcessed()) {
+            long deliveryCount = transactionService.countDeliveries(prepared.notificationId());
             return new SendNotificationResponse(
-                    notification.getId(),
-                    notification.getStatus(),
-                    deliveryRepository.countByNotificationId(notification.getId())
+                    prepared.notificationId(),
+                    prepared.status(),
+                    deliveryCount
             );
         }
 
-        User user = userRepository.findById(request.userId())
-                .orElseThrow(() -> new IllegalArgumentException("사용자를 찾을 수 없습니다."));
+        // Provider 호출 (DB 트랜잭션을 사용하지 않음)
+        List<DeliveryResult> results = sendDeliveries(prepared.deliveries());
 
-        Set<NotificationChannel> enabledChannels = preferenceRepository.findAllByUserIdAndEnabledTrue(user.getId())
-                .stream()
-                .map(NotificationPreference::getChannel)
-                .collect(Collectors.toSet());
+        // DB 작업
+        transactionService.complete(prepared.notificationId(), results);
 
-        Notification notification = notificationRepository.save(new Notification(request.eventId(), user));
-
-        List<NotificationDelivery> deliveries = new ArrayList<>();
-
-        for (NotificationChannel channel : request.channels()) {
-
-            if (!enabledChannels.contains(channel)) {
-                continue;
-            }
-
-            switch (channel) {
-                case PUSH -> createPushDeliveries(
-                        user,
-                        notification,
-                        deliveries
-                );
-
-                case SMS -> createSmsDelivery(
-                        user,
-                        notification,
-                        deliveries
-                );
-
-                case EMAIL -> createEmailDelivery(
-                        user,
-                        notification,
-                        deliveries
-                );
-            }
-        }
-
-        deliveryRepository.saveAll(deliveries);
-
-        notification.startProcessing();
-
-        sendDeliveries(deliveries);
-
-        boolean allSucceeded = deliveries.stream()
-                .allMatch(delivery -> delivery.getStatus() == DeliveryStatus.SENT);
-
-        if (allSucceeded) {
-            notification.complete();
-        } else {
-            notification.fail();
-        }
+        boolean allSucceeded = results.stream().allMatch(DeliveryResult::success);
 
         return new SendNotificationResponse(
-                notification.getId(),
-                notification.getStatus(),
-                deliveries.size()
+                prepared.notificationId(),
+                allSucceeded
+                ? NotificationStatus.COMPLETED
+                : NotificationStatus.FAILED,
+                prepared.deliveryCount()
         );
+
     }
 
-    private void sendDeliveries(List<NotificationDelivery> deliveries) {
+    private List<DeliveryResult> sendDeliveries(List<DeliveryCommand> deliveries) {
 
-        for (NotificationDelivery delivery : deliveries) {
-            delivery.recordAttempt();
+        List<DeliveryResult> results = new ArrayList<>();
 
-            ProviderResult result = switch (delivery.getChannel()) {
-                case PUSH -> pushProvider.send(delivery.getDestination());
-                case SMS -> smsProvider.send(delivery.getDestination());
-                case EMAIL -> emailProvider.send(delivery.getDestination());
-            };
+        for (DeliveryCommand delivery : deliveries) {
+            boolean success;
 
-            if (result.success()) {
-                delivery.markSent();
-            } else {
-                delivery.markFailed();
+            try {
+                ProviderResult result =
+                        switch (delivery.channel()) {
+                            case PUSH -> pushProvider.send(delivery.destination());
+                            case SMS -> smsProvider.send(delivery.destination());
+                            case EMAIL -> emailProvider.send(delivery.destination());
+                        };
+                success = result.success();
+            } catch (RuntimeException e) {
+                success = false;
             }
+
+            results.add(new DeliveryResult(delivery.deliveryId(), success));
         }
+
+        return results;
     }
 
-    private void createPushDeliveries(User user, Notification notification, List<NotificationDelivery> deliveries) {
-        List<UserDevice> devices = userDeviceRepository.findAllByUserIdAndActiveTrue(user.getId());
-
-        for (UserDevice device : devices) {
-            deliveries.add(
-                    new NotificationDelivery(
-                            notification,
-                            NotificationChannel.PUSH,
-                            device.getDeviceToken()
-                    )
-            );
-        }
-    }
-
-    private void createSmsDelivery(User user, Notification notification, List<NotificationDelivery> deliveries) {
-        if (user.getPhoneNumber() == null || user.getPhoneNumber().isBlank()) return;
-
-        deliveries.add(
-                new NotificationDelivery(
-                        notification,
-                        NotificationChannel.SMS,
-                        user.getPhoneNumber()
-                )
-        );
-    }
-
-    private void createEmailDelivery(User user, Notification notification, List<NotificationDelivery> deliveries) {
-        if (user.getEmail() == null || user.getEmail().isBlank()) return;
-
-        deliveries.add(
-                new NotificationDelivery(
-                        notification,
-                        NotificationChannel.EMAIL,
-                        user.getEmail()
-                )
-        );
-    }
 }
