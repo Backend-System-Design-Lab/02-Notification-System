@@ -16,7 +16,10 @@ public class SmsDeliveryConsumer {
     private final SmsProvider smsProvider;
     private final NotificationTransactionService transactionService;
 
-    @RabbitListener(queues = RabbitMqConfig.SMS_QUEUE)
+    @RabbitListener(
+            queues = RabbitMqConfig.SMS_QUEUE,
+            concurrency = "${NOTIFICATION_CONSUMER_CONCURRENCY:1}"
+    )
     public void consume(DeliveryMessage message) {
 
         boolean success;

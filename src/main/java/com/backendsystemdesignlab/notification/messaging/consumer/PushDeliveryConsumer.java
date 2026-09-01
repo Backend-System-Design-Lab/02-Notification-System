@@ -16,7 +16,10 @@ public class PushDeliveryConsumer {
     private final PushProvider pushProvider;
     private final NotificationTransactionService transactionService;
 
-    @RabbitListener(queues = RabbitMqConfig.PUSH_QUEUE)
+    @RabbitListener(
+            queues = RabbitMqConfig.PUSH_QUEUE,
+            concurrency = "${NOTIFICATION_CONSUMER_CONCURRENCY:1}"
+    )
     public void consume(DeliveryMessage message) {
 
         boolean success;
