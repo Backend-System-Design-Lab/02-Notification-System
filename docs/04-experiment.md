@@ -178,6 +178,58 @@ Transaction 2
 Provider 호출 방식과 지연 시간은 변경하지 않고,   
 DB Transaction의 범위만 변경하여 Connection 점유가 성능에 미치는 영향을 비교했다.
 
+### Experiment 2. RabbitMQ 비동기 처리
+
+Transaction Boundary 분리 후 DB Connection Pool 병목은 완화되었지만,   
+Notification API는 여전히 Mock Provider 호출이 완료될 때까지 응답을 반환하지 않았다.
+
+한 요청은 Push 2건, SMS 1건, Email 1건으로 총 4번의 Provider 호출을 수행하며,   
+각 Provider에 100ms의 지연이 존재하므로 최소 약 400ms의 응답 시간이 발생했다.
+
+Provider 호출을 HTTP 요청 처리 경로에서 제거하기 위해 RabbitMQ를 도입했다.
+
+```text
+기존
+
+HTTP Request
+    ↓
+DB 저장
+    ↓
+Provider 호출
+    ↓
+DB 상태 변경
+    ↓
+HTTP Response
+```
+```text
+RabbitMQ 적용 후
+
+HTTP Request
+    ↓
+DB 저장
+    ↓
+RabbitMQ Publish
+    ↓
+202 Accepted
+
+---------------------
+
+RabbitMQ Queue
+    ↓
+Consumer
+    ↓
+Mock Provider
+    ↓
+Delivery 상태 변경
+```
+
+Push, SMS, Email은 서로 다른 외부 Provider의 장애와 처리량에 독립적으로 대응할 수 있도록 채널별 Queue로 분리하였다.
+* `notification.push.queue`
+* `notification.sms.queue`
+* `notification.email.queue`
+
+API는 실제 알림 전송 완료를 기다리지 않고 요청 접수 후 `202 Accepted`를 반환한다.
+
 ## 11. 개선 후 결과
 
 ### Experiment 1. Transaction Boundary 분리 결과
@@ -202,6 +254,47 @@ Transaction Boundary 분리 후에는 Provider 호출 중 DB Connection을 반�
 Connection Pool의 지속적인 포화가 사라졌다.
 
 <img src="./images/transaction-boundary.png">
+
+### Experiment 2. RabbitMQ 비동기 처리 결과
+
+| VU | 지표 | Transaction Boundary | RabbitMQ Async | 변화 |
+|---:|---|---:|---:|---:|
+| 30 | RPS | 65.88 | 496.78 | 7.54배 |
+| 30 | Avg | 454.66ms | 60.05ms | 86.8% 감소 |
+| 30 | p95 | 560.98ms | 168.54ms | 70.0% 감소 |
+| 30 | p99 | 1.47s | 316.49ms | 78.5% 감소 |
+| 30 | Error Rate | 0% | 0% | 동일 |
+| 50 | RPS | 117.74 | 511.23 | 4.34배 |
+| 50 | Avg | 421.79ms | 97.41ms | 76.9% 감소 |
+| 50 | p95 | 456.86ms | 266.21ms | 41.7% 감소 |
+| 50 | p99 | 515.22ms | 514.63ms | 유사 |
+| 50 | Error Rate | 0% | 0% | 동일 |
+
+RabbitMQ 비동기화 후 Provider 호출이 HTTP 요청 경로에서 제거되면서   
+API 처리량이 크게 증가하고 평균 및 p95 응답 시간이 감소했다.
+
+50 VU에서는 최초 Baseline의 23.55 RPS에서 511.23 RPS로   
+약 21.7배의 API 처리량 증가를 확인했다.
+
+그러나 높은 Producer 처리량으로 인해 Consumer가 메시지 유입 속도를 따라가지 못하면서  
+Queue에 대량의 메시지가 적체되었다.
+
+#### Queue 상태
+| VU | PUSH Ready | SMS Ready | EMAIL Ready | Total Ready | Unacked |
+|---:|---:|---:|---:|---:|---:|
+| 30 | 28,494 | 13,572 | 13,577 | 55,643 | 750 |
+| 50 | 29,416 | 14,048 | 14,050 | 57,514 | 750 |
+
+따라서 RabbitMQ 적용으로 API의 응답 성능은 개선되었지만,   
+실제 알림 전달 처리량의 병목은 Consumer 영역으로 이동했다.
+
+<p>30 VU</p>
+<img src="./images/rabbitmq-async-30vu.png">
+<img src="./images/rabbitmq-queue-30vu.png">
+
+<p>50 VU</p>
+<img src="./images/rabbitmq-async-50vu.png">
+<img src="./images/rabbitmq-queue-50vu.png">
 
 ## 12. 결과 분석
 
@@ -242,12 +335,12 @@ Provider 호출 중에는 DB Connection을 점유하지 않으므로,
 50 VU / 약 0.422초
 ≈ 118 RPS
 ```
-실제 처리량인 117.74 RPS와 유사핟.
+실제 처리량인 117.74 RPS와 유사하다.
 
-이를 통해 Transcation Boundary 분리 이후에는 DB Connection Pool보다   
+이를 통해 Transaction Boundary 분리 이후에는 DB Connection Pool보다   
 동기식 Provider 호출 시간이 처리량과 응답 시간에 더 직접적인 영향을 주는 것으로 판단했다.
 
-### 12.3 남아 있는 병목
+### 12.3 Transaction Boundary 분리 후 남아 있던 병목
 
 DB Connection Pool 병목은 완화되었지만,   
 Notification API는 여전히 모든 Provider 호출이 끝날 때까지 HTTP 응답을 반환하지 않는다.
@@ -258,6 +351,54 @@ Notification API는 여전히 모든 Provider 호출이 끝날 때까지 HTTP �
 따라서 다음 실험에서는 RabbitMQ를 이용하여   
 Provider 호출을 HTTP 요청 처리 경로에서 분리하고,   
 API가 알림 요청을 Queue에 등록한 뒤 즉시 응답하도록 비동기 구조로 변경한다.
+
+### 12.4 Rabbit 비동기화 효과
+
+RabbitMQ 적용 후 HTTP 요청은 Mock Provider의 실행 완료를 기다리지 않고,   
+Notification 및 Delivery를 저장한 뒤 메시지를 Queue에 발행하고 즉시 응답한다.
+
+30 VU에서는 RPS는 65.88에서 496.78로 약 7.54배 증가했고,   
+p95는 560.98ms에서 168.54ms로 약 70% 감소했다.
+
+50 VU에서도 RPS는 117.74에서 511.23으로 4.34배 증가했으며,   
+p95는 456.86ms에서 266.21ms로 감소했다.
+
+최초 Baseline과 비교하면 50 VU 기준 RPS는   
+23.55에서 511.23으로 약 21.7배 증가했다.
+
+이는 Provider의 블로킹 I/O를 HTTP 요청 경로에서 분리함으로써   
+API가 알림의 실제 전송 시간과 독립적으로 요청을 처리할 수 있게 된 결과다.
+
+### 12.5 새로운 병목: Consumer 처리량
+
+비동기화 이후 API 처리량은 크게 증가했지만,   
+실제 알림 처리 속도가 함께 증가한 것은 아니다.
+
+30 VU 테스트에서 14,921개의 Notification 요청이 발생했다.   
+테스트 사용자는 요청당 Push 2건, SMS 1건, Email 1건을 생성하므로   
+약 59,684개의 Delivery 메시지가 RabbitMQ에 발행된다.
+
+테스트 종료 후 약 55,643개의 메시지가 Ready 상태로 남아 있었으며,   
+각 Queue에서는 250개의 메시지가 Unacked 상태로 Consumer에 전달되어 있었다.
+
+50 VU에서도 약 57,514개의 Ready 메시지가 남았다.
+
+따라서 Producer인 Notification API의 처리량이 Consumer의 처리량보다 높아지면서   
+Queue Backlog가 지속적으로 증가하는 새로운 병목이 발생했다.
+
+이는 비동기 시스템에서 API RPS만으로 전체 시스템 처리량을 평가할 수 업으며,   
+다음 지표를 함께 측정해야 힘을 보여준다.
+
+- API 요청 처리량
+- Queue Backlog
+- 메시지 유입률
+- Consumer 처리량
+- End-to-End 알림 전달 지연
+
+다음 단계에서는 Consumer concurrency와 RabbitMQ prefetch 설정을 분석하고,   
+Consumer 확장을 통해 Queue 적체를 완화할 수 있는지 실험한다.
+
+
 
 ## 13. Platform Thread와 Virtual Thread 비교
 
