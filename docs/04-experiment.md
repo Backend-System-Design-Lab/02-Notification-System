@@ -230,6 +230,40 @@ Push, SMS, Email은 서로 다른 외부 Provider의 장애와 처리량에 독�
 
 API는 실제 알림 전송 완료를 기다리지 않고 요청 접수 후 `202 Accepted`를 반환한다.
 
+### Experiment 3. Consumer Concurrency와 Prefetch 튜닝
+
+RabbitMQ 비동기화 이후 API의 응답 성능은 크게 개선되었지만,   
+Producer의 메시지 발행 속도가 Consumer 처리 속도를 초과하면서 Queue Backlog가 지속적으로 증가했다.
+
+초기 Consumer는 채널별로 1개씩 동작했으며,   
+Mock Provider가 Delivery당 100ms의 지연을 발생시키므로   
+Consumer 하나의 이론적인 최대 처리량은 약 10 msg/s이다.
+```text
+1 Consumer / 0.1초
+≈ 10 msg/s
+```
+
+실제 측정에서도 각 Queue의 각 Ack Rate는 약 9 msg/s로 확인되었다.
+
+이에 Consumer 수를 증가시켜 병렬 처리량을 개선할 수 있는지 확인하기 위해   
+Consumer Concurrency를 1, 5, 10으로 변경하여 비교했다.
+```text
+concurrency = 1
+Queue → Consumer 1개
+
+concurrency = 5
+Queue → Consumer 5개
+
+concurrency = 10
+Queue → Consumer 10개
+```
+
+이후 Consumer가 ACK 이전에 미리 전달받을 수 있는 메시지 수인 Prefetch를   
+10, 50, 250으로 변경하여 실제 처리량과 Unacked 메시지 수를 비교했다.
+
+Concurrency 실험에서는 Prefetch를 250으로 고정하고 30 VU로 측정했으며,   
+Prefetch 실험에서는 Concurrency를 5로 고정하고 50 VU로 측정했다.
+
 ## 11. 개선 후 결과
 
 ### Experiment 1. Transaction Boundary 분리 결과
@@ -296,6 +330,89 @@ Queue에 대량의 메시지가 적체되었다.
 <img src="./images/rabbitmq-async-50vu.png">
 <img src="./images/rabbitmq-queue-50vu.png">
 
+### Experiment 3. Consumer 처리량 튜닝 결과
+
+#### Consumer Concurrency
+
+Prefetch를 250으로 고정하고 30 VU에서 Consumer Concurrency를 변경했다.
+
+| Concurrency | API RPS | Avg | p95 | p99 | Queue당 Ack Rate | Total Backlog |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 463.69 | 64.33ms | 185.95ms | 415.50ms | 약 9 msg/s | 54,615 |
+| 5 | 338.21 | 88.33ms | 227.94ms | 418.88ms | 약 44 msg/s | 36,168 |
+| 10 | 289.62 | 103ms | 307.02ms | 603.43ms | 약 89 msg/s | 15,645 |
+
+Concurrency 증가에 따라 Consumer 처리량은 거의 선형적으로 증가했다.
+
+- Concurrency 1: 약 9 msg/s
+- Concurrency 5: 약 44 msg/s
+- Concurrency 10: 약 89 msg/s
+
+Concurrency 10에서는 Consumer 처리량과 Queue 적체는 크게 개선되었지만,   
+CPU 사용량이 최대 약 100%까지 증가하고 HikariCP Connection Pending도 크게 증가했다.
+
+API와 Consumer가 동일한 애플리케이션 인스턴스와 DB Connection Pool을 공유하고 있기 때문에   
+과도한 Consumer 병렬 처리가 API 처리 성능에도 영향을 준 것으로 판단했다.   
+
+따라서 현재 단일 인스턴스 환경에서는   
+Consumer 처리량과 API 자원 경합의 균형을 고려하여 Concurrency 5를 선택했다.
+
+> Total Backlog는 테스트 종료 시점의 모든 Queue의 Ready와 Unacked 메시지를 합산한 값이다.
+
+#### RabbitMQ Prefetch
+
+Consumer Concurrency를 5로 고정하고 50 VU에서 Prefetch를 변경했다. 
+
+| Prefetch | API RPS | Avg | p95 | p99 | Queue당 Ack Rate | Queue당 Unacked |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 289.49 | 171.91ms | 473.10ms | 985.53ms | 약 45 msg/s | 50 |
+| 50 | 445.85 | 111.61ms | 276.84ms | 504.00ms | 약 45 msg/s | 250 |
+| 250 | 508.60 | 97.89ms | 256.38ms | 458.10ms | 약 44~45 msg/s | 1,250 |
+
+Prefetch를 증가시켜도 Consumer의 실제 Ack Rate는 약 45 msg/s로 거의 동일했다.
+
+이는 Prefetch가 동시에 실행되는 Consumer 수를 증가시키는 설정이 아니라,   
+Consumer가 ACK 이전에 미리 전달받을 수 있는 메시지 수를 조절하는 설정이기 때문이다.
+
+Concurrency 5에서 예상 가능한 최대 Unacked 메시지 수는 다음과 같다.
+
+```text
+Prefetch 10
+5 Consumers × 10
+≈ 50
+
+Prefetch 50
+5 Consumers × 50
+≈ 250
+
+Prefetch 250
+5 Consumers × 250
+≈ 1,250
+```
+
+실제 측정값도 이와 동일하게 나타났다.
+
+Prefetch 250은 Prefetch 50에 비해 Consumer 처리량의 추가 향상이 없었지만,   
+Queue 당 Unacked 메시지가 250건에서 1,250건으로 5배 증가했다.
+
+Prefetch가 지나치게 크면 Consumer가 많은 메시지를 선점하여   
+Worker 장애 시 재전달해야 할 메시지가 증가하고,   
+Worker 간 메시지 분배의 유연성도 낮아질 수 있다.
+
+따라서 처리량과 In-flight 메시지 수의 균형을 고려하여 Prefetch 50을 선택했다.
+
+<p>Concurrency 1</p>
+<img src="./images/concurrency-1.png">
+
+<p>Concurrency 10</p>
+<img src="./images/concurrency-10.png">
+
+<p>Prefetch 10</p>
+<img src="./images/prefetch-10.png">
+
+<p>Prefetch 250</p>
+<img src="./images/prefetch-250.png">
+
 ## 12. 결과 분석
 
 ### 12.1 DB Connection Pool 병목 확인
@@ -352,7 +469,7 @@ Notification API는 여전히 모든 Provider 호출이 끝날 때까지 HTTP �
 Provider 호출을 HTTP 요청 처리 경로에서 분리하고,   
 API가 알림 요청을 Queue에 등록한 뒤 즉시 응답하도록 비동기 구조로 변경한다.
 
-### 12.4 Rabbit 비동기화 효과
+### 12.4 RabbitMQ 비동기화 효과
 
 RabbitMQ 적용 후 HTTP 요청은 Mock Provider의 실행 완료를 기다리지 않고,   
 Notification 및 Delivery를 저장한 뒤 메시지를 Queue에 발행하고 즉시 응답한다.
@@ -386,8 +503,8 @@ API가 알림의 실제 전송 시간과 독립적으로 요청을 처리할 수
 따라서 Producer인 Notification API의 처리량이 Consumer의 처리량보다 높아지면서   
 Queue Backlog가 지속적으로 증가하는 새로운 병목이 발생했다.
 
-이는 비동기 시스템에서 API RPS만으로 전체 시스템 처리량을 평가할 수 업으며,   
-다음 지표를 함께 측정해야 힘을 보여준다.
+이는 비동기 시스템에서 API RPS만으로 전체 시스템 처리량을 평가할 수 없으며,   
+다음 지표를 함께 측정해야 함을 보여준다.
 
 - API 요청 처리량
 - Queue Backlog
@@ -398,7 +515,50 @@ Queue Backlog가 지속적으로 증가하는 새로운 병목이 발생했다.
 다음 단계에서는 Consumer concurrency와 RabbitMQ prefetch 설정을 분석하고,   
 Consumer 확장을 통해 Queue 적체를 완화할 수 있는지 실험한다.
 
+### 12.6 Consumer Concurrency 증가 효과
 
+Consumer Concurrency를 1에서 5로 증가시키자   
+채널별 Ack Rate는 약 9 msg/s에서 약 44 msg/s로 약 4.9배 증가했다.
+
+Concurrency 10에서는 약 89 msg/s까지 증가하여   
+Mock Provider의 100ms 지연을 고려한 이론적인 처리량 증가와 유사한 결과를 보였다.
+
+그러나 Concurrency가 증가할수록 Consumer가 수행하는 Provider 호출과   
+DB 상태 갱신도 동시에 증가했다.   
+
+Concurrency 10에서는 CPU 사용량과 HikariCP Connection 대기가 크게 증가했고,   
+API RPS 역시 463.69에서 289.62로 감소했다.
+
+이를 통해 단순히 Consumer 수를 증가시키는 것만으로는   
+전체 시스템의 처리량을 무한히 확장할 수 없음을 확인했다.
+
+현재 구조에서는 Notification API와 Consumer가 동일한 프로세스 및   
+DB Connection Pool을 공유하기 때문에 Consumer의 부하가 API 처리에도 영향을 준다.
+
+따라서 더 높은 Consumer 처리량이 필요한 경우에는 Concurrency를 계속 증가시키기보다   
+API Server와 Worker를 분리하고 채널별 Worker를 독립적으로 수평 확장하는 구조가 적합하다.
+
+### 12.7 Prefetch 조정 결과
+
+Prefetch를 10, 50, 250으로 변경해도   
+Consumer의 Ack Rate는 약 45 msg/s로 유사하게 나타났다.
+
+따라서 현재 환경에서는 Prefetch 10 이상에서   
+Consumer가 처리할 메시지를 충분히 확보하고 있었으며,   
+Prefetch 증가가 실제 Provider 처리량 증가로 이어지지는 않았다.
+
+반면 Queue당 Unacked 메시지는   
+50건, 250건, 1,250건으로 Prefetch 값에 비례하여 증가했다.
+
+Prefetch를 과도하게 증가시키는 것은 처리량 개선 없이   
+In-flight 메시지 수만 증가시킬 수 있으므로,   
+현재 환경에서는 Prefetch 50을 처리량과 메시지 선점량 사이의 균형점으로 선택했다.
+
+단, Prefetch 테스트에서 API RPS에는 실행별 차이가 관찰되었다.   
+Consumer의 실제 Ack Rate는 동일했기 때문에 이를 Prefetch에 따른 직접적인    
+Consumer 처리량 향상으로 해석하지 않았으며,   
+동일 프로세스의 CPU 및 DB Connection Pool 자원 경합과   
+로컬 테스트 환경의 변동이 영향을 주었을 가능성이 있다.
 
 ## 13. Platform Thread와 Virtual Thread 비교
 
