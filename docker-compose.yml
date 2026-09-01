@@ -15,6 +15,10 @@ services:
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/notification
       SPRING_DATASOURCE_USERNAME: notification
       SPRING_DATASOURCE_PASSWORD: notification
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: notification
+      SPRING_RABBITMQ_PASSWORD: notification
 
     healthcheck:
       test:
@@ -26,6 +30,12 @@ services:
       timeout: 3s
       retries: 5
       start_period: 20s
+
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
 
   prometheus:
     image: prom/prometheus:v3.13.0
@@ -98,6 +108,21 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: notification-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: notification
+      RABBITMQ_DEFAULT_PASS: notification
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
   prometheus-data:

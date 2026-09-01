@@ -1,5 +1,6 @@
 package com.backendsystemdesignlab.notification.notification.service;
 
+import com.backendsystemdesignlab.notification.notification.domain.DeliveryStatus;
 import com.backendsystemdesignlab.notification.notification.domain.Notification;
 import com.backendsystemdesignlab.notification.notification.domain.NotificationDelivery;
 import com.backendsystemdesignlab.notification.notification.dto.DeliveryCommand;
@@ -106,6 +107,44 @@ public class NotificationTransactionService {
                 commands,
                 false
         );
+    }
+
+    @Transactional
+    public void recordDeliveryResult(Long notificationId, Long deliveryId, boolean success) {
+        Notification notification = notificationRepository.findByIdForUpdate(notificationId)
+                .orElseThrow(() -> new IllegalArgumentException("알림을 찾을 수 없습니다."));
+
+        NotificationDelivery delivery = deliveryRepository.findById(deliveryId)
+                .orElseThrow(() -> new IllegalArgumentException("전송 정보를 찾을 수 없습니다."));
+
+        if (delivery.getStatus() == DeliveryStatus.SENT || delivery.getStatus() == DeliveryStatus.FAILED) {
+            return;
+        }
+
+        delivery.recordAttempt();
+
+        if (success) {
+            delivery.markSent();
+        } else {
+            delivery.markFailed();
+        }
+
+        deliveryRepository.flush();
+
+        long total = deliveryRepository.countByNotificationId(notificationId);
+        long sent = deliveryRepository.countByNotificationIdAndStatus(notificationId, DeliveryStatus.SENT);
+        long failed = deliveryRepository.countByNotificationIdAndStatus(notificationId, DeliveryStatus.FAILED);
+
+        // 아직 처리 중인 Delivery 존재
+        if (sent + failed < total) {
+            return;
+        }
+
+        if (failed > 0) {
+            notification.fail();
+        } else {
+            notification.complete();
+        }
     }
 
     @Transactional
