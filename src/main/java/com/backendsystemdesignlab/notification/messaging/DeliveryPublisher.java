@@ -20,7 +20,7 @@ public class DeliveryPublisher {
     }
 
     private void publish(Long notificationId, DeliveryCommand delivery) {
-        DeliveryMessage message = new DeliveryMessage(notificationId, delivery.deliveryId(), delivery.channel(), delivery.destination());
+        DeliveryMessage message = new DeliveryMessage(notificationId, delivery.deliveryId(), delivery.channel(), delivery.destination(), 1);
 
         String routingKey = switch (delivery.channel()) {
             case PUSH -> RabbitMqConfig.PUSH_ROUTING_KEY;

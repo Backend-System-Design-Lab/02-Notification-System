@@ -49,3 +49,8 @@ management:
     distribution:
       percentiles-histogram:
         http.server.requests: true
+
+mock:
+  provider:
+    force-failure: ${MOCK_PROVIDER_FORCE_FAILURE:false}
+    fail-first-attempts: ${MOCK_PROVIDER_FAIL_FIRST_ATTEMPTS:0}
