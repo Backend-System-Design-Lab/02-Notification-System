@@ -4,7 +4,6 @@ import com.backendsystemdesignlab.notification.notification.domain.DeliveryStatu
 import com.backendsystemdesignlab.notification.notification.domain.Notification;
 import com.backendsystemdesignlab.notification.notification.domain.NotificationDelivery;
 import com.backendsystemdesignlab.notification.notification.dto.DeliveryCommand;
-import com.backendsystemdesignlab.notification.notification.dto.DeliveryResult;
 import com.backendsystemdesignlab.notification.notification.dto.PreparedNotification;
 import com.backendsystemdesignlab.notification.notification.dto.SendNotificationRequest;
 import com.backendsystemdesignlab.notification.notification.repository.NotificationDeliveryRepository;
@@ -22,9 +21,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 
 @Service
@@ -110,25 +107,55 @@ public class NotificationTransactionService {
     }
 
     @Transactional
-    public void recordDeliveryResult(Long notificationId, Long deliveryId, boolean success) {
+    public void recordRetryFailure(Long deliveryId) {
+
+        NotificationDelivery delivery = deliveryRepository.findById(deliveryId)
+                .orElseThrow(() -> new IllegalArgumentException("전송 정보를 찾을 수 없습니다."));
+
+        if (delivery.getStatus() != DeliveryStatus.PENDING) {
+            return;
+        }
+
+        delivery.recordAttempt();
+    }
+
+    @Transactional
+    public void recordSuccess(Long notificationId, Long deliveryId) {
         Notification notification = notificationRepository.findByIdForUpdate(notificationId)
                 .orElseThrow(() -> new IllegalArgumentException("알림을 찾을 수 없습니다."));
 
         NotificationDelivery delivery = deliveryRepository.findById(deliveryId)
                 .orElseThrow(() -> new IllegalArgumentException("전송 정보를 찾을 수 없습니다."));
 
-        if (delivery.getStatus() == DeliveryStatus.SENT || delivery.getStatus() == DeliveryStatus.FAILED) {
+        if (delivery.getStatus() != DeliveryStatus.PENDING) {
             return;
         }
 
         delivery.recordAttempt();
+        delivery.markSent();
 
-        if (success) {
-            delivery.markSent();
-        } else {
-            delivery.markFailed();
+        updateNotificationStatus(notificationId, notification);
+    }
+
+    @Transactional
+    public void recordFinalFailure(Long notificationId, Long deliveryId) {
+        Notification notification = notificationRepository.findByIdForUpdate(notificationId)
+                .orElseThrow(() -> new IllegalArgumentException("알림을 찾을 수 없습니다."));
+
+        NotificationDelivery delivery = deliveryRepository.findById(deliveryId)
+                .orElseThrow(() -> new IllegalArgumentException("전송 정보를 찾을 수 없습니다."));
+
+        if (delivery.getStatus() != DeliveryStatus.PENDING) {
+            return;
         }
 
+        delivery.recordAttempt();
+        delivery.markFailed();
+
+        updateNotificationStatus(notificationId, notification);
+    }
+
+    private void updateNotificationStatus(Long notificationId, Notification notification) {
         deliveryRepository.flush();
 
         long total = deliveryRepository.countByNotificationId(notificationId);
@@ -144,44 +171,6 @@ public class NotificationTransactionService {
             notification.fail();
         } else {
             notification.complete();
-        }
-    }
-
-    @Transactional
-    public void complete(Long notificationId, List<DeliveryResult> results) {
-
-        // 기존 notification 객체를 쓰지 않는 이유는 첫 번째 Transaction이 끝났기 때문에 두 번째 Transaction에서는 새 영속성 컨텍스트에서 다시 조회
-        Notification notification = notificationRepository.findById(notificationId)
-                .orElseThrow(() -> new IllegalArgumentException("알림을 찾을 수 없습니다."));
-
-        List<Long> deliveryIds = results.stream().map(DeliveryResult::deliveryId).toList();
-
-        Map<Long, NotificationDelivery> deliveryMap = deliveryRepository.findAllById(deliveryIds)
-                .stream()
-                .collect(Collectors.toMap(NotificationDelivery::getId, Function.identity()));
-
-        for (DeliveryResult result : results) {
-            NotificationDelivery delivery = deliveryMap.get(result.deliveryId());
-
-            if (delivery == null) {
-                throw new IllegalStateException("전송 정보를 찾을 수 없습니다. id=" + result.deliveryId());
-            }
-
-            delivery.recordAttempt();
-
-            if (result.success()) {
-                delivery.markSent();
-            } else {
-                delivery.markFailed();
-            }
-        }
-
-        boolean allSucceeded = results.stream().allMatch(DeliveryResult::success);
-
-        if (allSucceeded) {
-            notification.complete();
-        } else {
-            notification.fail();
         }
     }
 
