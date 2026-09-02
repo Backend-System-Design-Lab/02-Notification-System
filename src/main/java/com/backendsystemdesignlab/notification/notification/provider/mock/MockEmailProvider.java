@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -14,6 +15,7 @@ public class MockEmailProvider implements EmailProvider {
 
     private final boolean forceFailure;
     private final int failFirstAttempts;
+    private final Set<String> processedKeys = ConcurrentHashMap.newKeySet();
 
     private final Map<String, AtomicInteger> attempts = new ConcurrentHashMap<>();
 
@@ -25,8 +27,13 @@ public class MockEmailProvider implements EmailProvider {
     }
 
     @Override
-    public ProviderResult send(String email) {
+    public ProviderResult send(String email,  String idempotencyKey) {
         simulateDelay();
+
+        if (processedKeys.contains(idempotencyKey)) {
+            return new ProviderResult(true);
+        }
+
         if (forceFailure) return new ProviderResult(false);
 
         int currentAttempt = attempts.computeIfAbsent(email, key -> new AtomicInteger()).incrementAndGet(); // 증가 연산을 원자적 처리
@@ -35,6 +42,7 @@ public class MockEmailProvider implements EmailProvider {
             return new ProviderResult(false);
         }
 
+        processedKeys.add(idempotencyKey);
         return new ProviderResult(true);
     }
 

@@ -27,6 +27,10 @@ spring:
     listener:
       simple:
         prefetch: ${RABBITMQ_PREFETCH:250}
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
 
 management:
   endpoints:
@@ -54,3 +58,6 @@ mock:
   provider:
     force-failure: ${MOCK_PROVIDER_FORCE_FAILURE:false}
     fail-first-attempts: ${MOCK_PROVIDER_FAIL_FIRST_ATTEMPTS:0}
+
+outbox:
+  publish-interval-ms: ${OUTBOX_PUBLISH_INTERVAL_MS:1000}
