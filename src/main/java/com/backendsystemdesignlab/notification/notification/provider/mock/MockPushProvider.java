@@ -5,19 +5,29 @@ import com.backendsystemdesignlab.notification.notification.provider.PushProvide
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
 @Component
 public class MockPushProvider implements PushProvider {
 
     private final boolean forceFailure;
+    private final Set<String> processedKeys = ConcurrentHashMap.newKeySet();
 
     public MockPushProvider(@Value("${mock.provider.force-failure:false}") boolean forceFailure) {
         this.forceFailure = forceFailure;
     }
 
     @Override
-    public ProviderResult send(String deviceToken) {
+    public ProviderResult send(String deviceToken, String idempotencyKey) {
         simulateDelay();
+
+        if (processedKeys.contains(idempotencyKey)) {
+            return new ProviderResult(true);
+        }
+
         if (forceFailure) return new ProviderResult(false);
+        processedKeys.add(idempotencyKey);
         return new ProviderResult(true);
     }
 

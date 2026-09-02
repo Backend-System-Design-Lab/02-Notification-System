@@ -23,6 +23,8 @@ public class DeliveryMessageHandler {
 
     public void handle(DeliveryMessage message) {
 
+        if (transactionService.isAlreadyProcessed(message.deliveryId())) return;
+
         boolean success = send(message);
 
         if (success) {
@@ -43,12 +45,14 @@ public class DeliveryMessageHandler {
 
     private boolean send(DeliveryMessage message) {
 
+        String idempotencyKey = "notification-delivery-" + message.deliveryId();
+
         try {
             ProviderResult result =
                     switch (message.channel()) {
-                        case PUSH -> pushProvider.send(message.destination());
-                        case SMS -> smsProvider.send(message.destination());
-                        case EMAIL -> emailProvider.send(message.destination());
+                        case PUSH -> pushProvider.send(message.destination(), idempotencyKey);
+                        case SMS -> smsProvider.send(message.destination(), idempotencyKey);
+                        case EMAIL -> emailProvider.send(message.destination(), idempotencyKey);
                     };
             return result.success();
         } catch (RuntimeException e) {

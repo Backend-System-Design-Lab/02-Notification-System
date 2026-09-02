@@ -28,7 +28,7 @@ public class NotificationService {
             );
         }
 
-        deliveryPublisher.publishAll(prepared.notificationId(), prepared.deliveries());
+//        deliveryPublisher.publishAll(prepared.notificationId(), prepared.deliveries());
 
         return new SendNotificationResponse(
                 prepared.notificationId(),
