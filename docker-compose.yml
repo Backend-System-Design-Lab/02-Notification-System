@@ -24,6 +24,8 @@ services:
       MOCK_PROVIDER_FORCE_FAILURE: ${MOCK_PROVIDER_FORCE_FAILURE:-false}
       MOCK_PROVIDER_FAIL_FIRST_ATTEMPTS: ${MOCK_PROVIDER_FAIL_FIRST_ATTEMPTS:-0}
       OUTBOX_PUBLISH_INTERVAL_MS: ${OUTBOX_PUBLISH_INTERVAL_MS:-1000}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
 
     healthcheck:
       test:
@@ -40,6 +42,8 @@ services:
       mysql:
         condition: service_healthy
       rabbitmq:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   prometheus:
@@ -128,6 +132,16 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  redis:
+    image: redis:7.4
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   prometheus-data:

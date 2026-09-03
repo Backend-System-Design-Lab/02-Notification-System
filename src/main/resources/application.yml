@@ -32,6 +32,11 @@ spring:
     template:
       mandatory: true
 
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+
 management:
   endpoints:
     web:
@@ -61,3 +66,10 @@ mock:
 
 outbox:
   publish-interval-ms: ${OUTBOX_PUBLISH_INTERVAL_MS:1000}
+
+
+notification:
+  rate-limit:
+    push: ${PUSH_RATE_LIMIT:1000}
+    sms: ${SMS_RATE_LIMIT:5}
+    email: ${EMAIL_RATE_LIMIT:1000}

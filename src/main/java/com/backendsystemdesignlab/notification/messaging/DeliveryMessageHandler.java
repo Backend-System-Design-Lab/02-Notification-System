@@ -5,6 +5,8 @@ import com.backendsystemdesignlab.notification.notification.provider.ProviderRes
 import com.backendsystemdesignlab.notification.notification.provider.PushProvider;
 import com.backendsystemdesignlab.notification.notification.provider.SmsProvider;
 import com.backendsystemdesignlab.notification.notification.service.NotificationTransactionService;
+import com.backendsystemdesignlab.notification.ratelimit.NotificationRateLimiter;
+import com.backendsystemdesignlab.notification.ratelimit.ThrottlePublisher;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
@@ -21,9 +23,17 @@ public class DeliveryMessageHandler {
     private final DeliveryRetryPublisher retryPublisher;
     private final NotificationTransactionService transactionService;
 
+    private final NotificationRateLimiter rateLimiter;
+    private final ThrottlePublisher throttlePublisher;
+
     public void handle(DeliveryMessage message) {
 
         if (transactionService.isAlreadyProcessed(message.deliveryId())) return;
+
+        if (!rateLimiter.tryAcquire(message.channel())) {
+            throttlePublisher.publish(message);
+            return;
+        }
 
         boolean success = send(message);
 

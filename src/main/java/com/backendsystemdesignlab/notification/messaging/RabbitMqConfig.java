@@ -26,6 +26,14 @@ public class RabbitMqConfig {
     public static final String SMS_DLQ = "notification.sms.dlq";
     public static final String EMAIL_DLQ = "notification.email.dlq";
 
+    public static final String THROTTLE_EXCHANGE = "notification.throttle.exchange";
+    public static final String PUSH_THROTTLE_QUEUE = "notification.push.throttle.queue";
+    public static final String SMS_THROTTLE_QUEUE = "notification.sms.throttle.queue";
+    public static final String EMAIL_THROTTLE_QUEUE = "notification.email.throttle.queue";
+    public static final String PUSH_THROTTLE_ROUTING_KEY = "notification.push.throttle";
+    public static final String SMS_THROTTLE_ROUTING_KEY = "notification.sms.throttle";
+    public static final String EMAIL_THROTTLE_ROUTING_KEY = "notification.email.throttle";
+
     // Exchange: 메시지를 받아서 적절한 Queue로 전달하는 라우터
     @Bean
     public DirectExchange notificationExchange() {
@@ -41,6 +49,11 @@ public class RabbitMqConfig {
     @Bean
     public DirectExchange deadLetterExchange() {
         return new DirectExchange(DLX, true, false);
+    }
+
+    @Bean
+    public DirectExchange throttleExchange() {
+        return new DirectExchange(THROTTLE_EXCHANGE, true, false);
     }
 
     @Bean
@@ -106,6 +119,36 @@ public class RabbitMqConfig {
     public Queue emailDlq() {
         return QueueBuilder
                 .durable(EMAIL_DLQ)
+                .build();
+    }
+
+    @Bean
+    public Queue pushThrottleQueue() {
+        return QueueBuilder
+                .durable(PUSH_THROTTLE_QUEUE)
+                .ttl(1000)
+                .deadLetterExchange(EXCHANGE)
+                .deadLetterRoutingKey(PUSH_ROUTING_KEY)
+                .build();
+    }
+
+    @Bean
+    public Queue smsThrottleQueue() {
+        return QueueBuilder
+                .durable(SMS_THROTTLE_QUEUE)
+                .ttl(1000)
+                .deadLetterExchange(EXCHANGE)
+                .deadLetterRoutingKey(SMS_ROUTING_KEY)
+                .build();
+    }
+
+    @Bean
+    public Queue emailThrottleQueue() {
+        return QueueBuilder
+                .durable(EMAIL_THROTTLE_QUEUE)
+                .ttl(1000)
+                .deadLetterExchange(EXCHANGE)
+                .deadLetterRoutingKey(EMAIL_ROUTING_KEY)
                 .build();
     }
 
@@ -180,6 +223,30 @@ public class RabbitMqConfig {
                 .bind(emailDlq)
                 .to(deadLetterExchange)
                 .with(EMAIL_ROUTING_KEY);
+    }
+
+    @Bean
+    public Binding pushThrottleBinding(Queue pushThrottleQueue, DirectExchange throttleExchange) {
+        return BindingBuilder
+                .bind(pushThrottleQueue)
+                .to(throttleExchange)
+                .with(PUSH_THROTTLE_ROUTING_KEY);
+    }
+
+    @Bean
+    public Binding smsThrottleBinding(Queue smsThrottleQueue, DirectExchange throttleExchange) {
+        return BindingBuilder
+                .bind(smsThrottleQueue)
+                .to(throttleExchange)
+                .with(SMS_THROTTLE_ROUTING_KEY);
+    }
+
+    @Bean
+    public Binding emailThrottleBinding(Queue emailThrottleQueue, DirectExchange throttleExchange) {
+        return BindingBuilder
+                .bind(emailThrottleQueue)
+                .to(throttleExchange)
+                .with(EMAIL_THROTTLE_ROUTING_KEY);
     }
 
     @Bean
