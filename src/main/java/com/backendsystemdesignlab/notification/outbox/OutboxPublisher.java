@@ -22,6 +22,7 @@ public class OutboxPublisher {
     private final OutboxTransactionService transactionService;
     private final RabbitTemplate rabbitTemplate;
     private final NotificationTransactionService notificationTransactionService;
+    private final OutboxFailureService failureService;
 
     // DB Connection 없음 (RabbitMQ가 DB를 잡고 있지 않게)
     @Scheduled(
@@ -95,14 +96,9 @@ public class OutboxPublisher {
 
     private void handleFailure(OutboxEvent event, String reason) {
 
-        boolean finalFailure = transactionService.recordPublishFailure(event.getId(), reason);
+        boolean finalFailure = failureService.recordFailure(event.getId(), reason);
 
         if (finalFailure) {
-            notificationTransactionService.recordPublishFinalFailure(
-                    event.getNotificationId(),
-                    event.getDeliveryId()
-            );
-
             log.error("Outbox 마지막 시도 실패. outboxId={}, reason={}", event.getId(), reason);
         } else {
             log.warn("Outbox publish 실패.  outboxId={}, reason={}", event.getId(), reason);

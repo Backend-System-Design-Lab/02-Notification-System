@@ -11,7 +11,6 @@ import java.util.List;
 public class OutboxTransactionService {
 
     private final OutboxEventRepository outboxEventRepository;
-    private static final int MAX_PUBLISH_ATTEMPTS = 5;
 
     @Transactional(readOnly = true)
     public List<OutboxEvent> findPendingEvents() {
@@ -27,24 +26,5 @@ public class OutboxTransactionService {
             return;
         }
         event.markPublished();
-    }
-
-    @Transactional
-    public boolean recordPublishFailure(Long outboxEventId, String error) {
-        OutboxEvent event = outboxEventRepository.findById(outboxEventId)
-                .orElseThrow(() -> new IllegalArgumentException("Outbox event not found: " + outboxEventId));
-
-        if (event.getStatus() != OutboxStatus.PENDING) {
-            return false;
-        }
-
-        event.recordFailure(error);
-
-        if (event.getAttemptCount() >= MAX_PUBLISH_ATTEMPTS) {
-            event.markFailed();
-            return true;
-        }
-
-        return false;
     }
 }
