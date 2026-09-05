@@ -1,9 +1,10 @@
 package com.backendsystemdesignlab.notification.notification.service;
 
-import com.backendsystemdesignlab.notification.messaging.DeliveryPublisher;
+import com.backendsystemdesignlab.notification.dedup.NotificationDedupCache;
 import com.backendsystemdesignlab.notification.notification.dto.*;
 
 import lombok.RequiredArgsConstructor;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -11,30 +12,46 @@ import org.springframework.stereotype.Service;
 public class NotificationService {
 
     private final NotificationTransactionService transactionService;
-    private final DeliveryPublisher deliveryPublisher;
+    private final NotificationDedupCache dedupCache;
 
     public SendNotificationResponse send(SendNotificationRequest request) {
 
-        // DB 작업
-        PreparedNotification prepared = transactionService.prepare(request);
+        // 1. Redis Fast Path
+        var cached = dedupCache.find(request.eventId());
+
+        if (cached.isPresent()) {
+            return cached.get();
+        }
+
+        // 2. 기존 DB 처리
+        PreparedNotification prepared;
+
+        try {
+            prepared = transactionService.prepare(request);
+        } catch (DataIntegrityViolationException e) {
+            return transactionService.findExisingResponse(request.eventId())
+                    .orElseThrow(() -> e);
+        }
+        SendNotificationResponse response;
 
         // 이미 처리했던 eventId
         if (prepared.alreadyProcessed()) {
             long deliveryCount = transactionService.countDeliveries(prepared.notificationId());
-            return new SendNotificationResponse(
+            response = new SendNotificationResponse(
                     prepared.notificationId(),
                     prepared.status(),
                     deliveryCount
             );
+        } else {
+            response = new SendNotificationResponse(
+                    prepared.notificationId(),
+                    prepared.status(),
+                    prepared.deliveryCount()
+            );
         }
 
-//        deliveryPublisher.publishAll(prepared.notificationId(), prepared.deliveries());
+        dedupCache.save(request.eventId(), response);
 
-        return new SendNotificationResponse(
-                prepared.notificationId(),
-                prepared.status(), // PROCESSING 비동기 이기 때문에 아직 Provider 전송이 안끝남
-                prepared.deliveryCount()
-        );
-
+        return response;
     }
 }

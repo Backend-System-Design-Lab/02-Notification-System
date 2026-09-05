@@ -6,6 +6,7 @@ import com.backendsystemdesignlab.notification.notification.domain.NotificationD
 import com.backendsystemdesignlab.notification.notification.dto.DeliveryCommand;
 import com.backendsystemdesignlab.notification.notification.dto.PreparedNotification;
 import com.backendsystemdesignlab.notification.notification.dto.SendNotificationRequest;
+import com.backendsystemdesignlab.notification.notification.dto.SendNotificationResponse;
 import com.backendsystemdesignlab.notification.notification.repository.NotificationDeliveryRepository;
 import com.backendsystemdesignlab.notification.notification.repository.NotificationRepository;
 import com.backendsystemdesignlab.notification.outbox.OutboxEvent;
@@ -21,10 +22,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
@@ -257,5 +255,18 @@ public class NotificationTransactionService {
         delivery.markFailed();
 
         updateNotificationStatus(notificationId, notification);
+    }
+
+    @Transactional(readOnly = true)
+    public Optional<SendNotificationResponse> findExisingResponse(String eventId) {
+        return notificationRepository.findByEventId(eventId)
+                .map(notification -> {
+                    long deliveryCount = deliveryRepository.countByNotificationId(notification.getId());
+                    return new SendNotificationResponse(
+                            notification.getId(),
+                            notification.getStatus(),
+                            deliveryCount
+                    );
+                });
     }
 }
