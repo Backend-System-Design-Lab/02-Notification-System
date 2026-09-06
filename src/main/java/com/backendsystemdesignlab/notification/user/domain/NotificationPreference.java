@@ -52,4 +52,8 @@ public class NotificationPreference {
     public boolean isEnabled() {
         return enabled;
     }
+
+    public void changeEnabled(boolean enabled) {
+        this.enabled = enabled;
+    }
 }

@@ -11,11 +11,11 @@ import com.backendsystemdesignlab.notification.notification.repository.Notificat
 import com.backendsystemdesignlab.notification.notification.repository.NotificationRepository;
 import com.backendsystemdesignlab.notification.outbox.OutboxEvent;
 import com.backendsystemdesignlab.notification.outbox.OutboxEventRepository;
+import com.backendsystemdesignlab.notification.preference.NotificationPreferenceService;
 import com.backendsystemdesignlab.notification.user.domain.NotificationChannel;
 import com.backendsystemdesignlab.notification.user.domain.NotificationPreference;
 import com.backendsystemdesignlab.notification.user.domain.User;
 import com.backendsystemdesignlab.notification.user.domain.UserDevice;
-import com.backendsystemdesignlab.notification.user.repository.NotificationPreferenceRepository;
 import com.backendsystemdesignlab.notification.user.repository.UserDeviceRepository;
 import com.backendsystemdesignlab.notification.user.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
@@ -31,7 +31,7 @@ public class NotificationTransactionService {
 
     private final UserRepository userRepository;
     private final UserDeviceRepository userDeviceRepository;
-    private final NotificationPreferenceRepository preferenceRepository;
+    private final NotificationPreferenceService preferenceService;
     private final NotificationRepository notificationRepository;
     private final NotificationDeliveryRepository deliveryRepository;
     private final OutboxEventRepository outboxEventRepository;
@@ -55,10 +55,7 @@ public class NotificationTransactionService {
         User user = userRepository.findById(request.userId())
                 .orElseThrow(() -> new IllegalArgumentException("사용자를 찾을 수 없습니다."));
 
-        Set<NotificationChannel> enabledChannels = preferenceRepository.findAllByUserIdAndEnabledTrue(user.getId())
-                .stream()
-                .map(NotificationPreference::getChannel)
-                .collect(Collectors.toSet());
+        Set<NotificationChannel> enabledChannels = preferenceService.getEnabledChannels(user.getId());
 
         Notification notification = notificationRepository.save(new Notification(request.eventId(), user));
 

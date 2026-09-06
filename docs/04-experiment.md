@@ -264,6 +264,76 @@ Queue → Consumer 10개
 Concurrency 실험에서는 Prefetch를 250으로 고정하고 30 VU로 측정했으며,   
 Prefetch 실험에서는 Concurrency를 5로 고정하고 50 VU로 측정했다.
 
+### Experiment 4. Redis Preference Cache
+
+Notification 생성 시 사용자의 채널별 알림 허용 여부를 확인하기 위해   
+매 요청마다 MySQL의 `notification_preferences` 테이블을 조회하고 있었다.
+
+동일 사용자에게 반복적으로 알림이 발생하는 경우에도 Preference는 자주 변경되지 않기 때문에   
+동일한 DB 조회가 반복되는 문제가 있었다.
+
+이에 사용자별 활성화된 알림 채널을 Redis에 저장하는 Cache-Aside 구조를 적용했다.
+
+```text
+기존
+
+Notification 요청
+    ↓
+MySQL Preference 조회
+    ↓
+Delivery 생성
+```
+
+```text
+Redis Cache 적용
+
+Notification 요청
+    ↓
+Redis Preference 조회
+    ├─ HIT → 활성 Channel 사용
+    │
+    └─ MISS
+         ↓
+       MySQL 조회
+         ↓
+       Redis 저장
+```
+Redis Key는 사용자 단위로 구성했다.
+```text
+notification:preference:{userId}
+```
+Value에는 사용자가 활성화한 전체 Channel을 저장한다.
+```json
+{
+  "enabledChannels": ["PUSH", "EMAIL"]
+}
+```
+TTL은 30분으로 설정했다.   
+Preference 변경 시에는 DB를 먼저 갱신한 뒤 Redis Cache를 삭제한다.
+```text
+Preference 변경
+    ↓
+DB UPDATE + COMMIT
+    ↓
+Redis Cache Evict
+    ↓
+다음 Notification 요청
+    ↓
+Cache MISS
+    ↓
+DB 최신 Preference 조회
+    ↓
+Redis Cache 재구성
+```
+Redis 장애 시에는 Cache 조회와 저장 실패가 Notification 요청 실패로 전파되지 않도록   
+MySQL을 기준 데이터로 사용하는 DB Fallback 구조로 적용했다.
+
+성능 실험에서는 동일한 `userId`를 사용하면서   
+각 요청마다 새로운 `eventID`를 생성했다.
+
+이는 동일 `eventId` 사용 시 앞서 구현한 Dedup Cache가 요청을 먼저 처리하여   
+Preference 조회 로직 자체가 실행되지 않는 것을 방지하기 위함이다.
+
 ## 11. 개선 후 결과
 
 ### Experiment 1. Transaction Boundary 분리 결과
@@ -413,6 +483,26 @@ Worker 간 메시지 분배의 유연성도 낮아질 수 있다.
 <p>Prefetch 250</p>
 <img src="./images/prefetch-250.png">
 
+### Experiment 4. Redis Preference Cache 결과
+
+30 VU, 30초 동안 동일 사용자에게 새로운 `eventId`로 알림을 반복 생성했다.
+
+| 지표 | DB Preference 조회 | Redis Preference Cache | 변화 |
+|---|---:|---:|---:|
+| RPS | 180.51 | 513.69 | 2.85배 |
+| Avg | 164.96ms | 58.02ms | 64.8% 감소 |
+| Median | 104.91ms | 47.95ms | 54.3% 감소 |
+| p90 | 358.47ms | 99.91ms | 72.1% 감소 |
+| p95 | 455.88ms | 129.45ms | 71.6% 감소 |
+| Error Rate | 0% | 0% | 동일 |
+
+Redis Cache 적용 후 RPS는 180.51에서 513.69로 약 2.85배 증가했다.
+
+평균 응답 시간은 164.96ms에서 58.02ms로 약 64.8% 감소했으며,   
+p95는 455.88ms에서 129.45ms로 약 71.6% 감소했다.
+
+두 실험 모두 HTTP 요청 실패는 발생하지 않았다.
+
 ## 12. 결과 분석
 
 ### 12.1 DB Connection Pool 병목 확인
@@ -559,6 +649,38 @@ Consumer의 실제 Ack Rate는 동일했기 때문에 이를 Prefetch에 따른 
 Consumer 처리량 향상으로 해석하지 않았으며,   
 동일 프로세스의 CPU 및 DB Connection Pool 자원 경합과   
 로컬 테스트 환경의 변동이 영향을 주었을 가능성이 있다.
+
+### 12.8 Redis Preference Cache 적용 효과
+
+Cache 미적용 구조에서는 새로운 Notification 요청마다    
+사용자의 활성화된 알림 Channel을 MySQL에서 조회했다.
+
+Preference는 알림 요청 빈도에 비해 변경 빈도가 낮은 데이터이므로,   
+동일 사용자에게 알림 요청이 반복될수록 동일한 SELECT가 계속 발생했다.
+
+Redis Cache-Aside 적용 후에는 최초 Cache MISS 요청에서만 DB를 조회하고,   
+이후 요청에서는 Redis에 저장된 활성 Channel을 사용했다.
+
+30 VU 테스트에서 RPS는 180.51에서 513.69로 약 2.85배 증가했고,   
+p95는 455.88ms에서 129.45ms로 약 71.6% 감소했다.
+
+단, Redis Cache가 Notification 생성 자체를 제거하느 ㄴ것은 아니다.
+
+각 요청마다 여전히 다음 작업은 수행된다.
+
+- Notification INSERT
+- Delivery INSERT
+- Outbox INSERT
+
+따라서 이번 개선은 알림 생성 자체를 캐싱한 것이 아니라,   
+반복적으로 발생하던 Preference 조회 경로를 Redis로 전환하여   
+MySQL 조회 부하와 Connection 점유를 줄인 결과로 해석했다.
+
+또한 Preference 변경 시에는 DB 갱신 이후 Cache를 삭제하여   
+다음 요청에서 최신 DB 값을 다시 Cache에 저장하도록 했다.
+
+Redis 장애 시에는 DB Fallback을 수행하므로   
+Cache 장애가 Notification API 실패로 직접 전파되지 않도록 구성했다.
 
 ## 13. Platform Thread와 Virtual Thread 비교
 
