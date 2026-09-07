@@ -4,7 +4,7 @@ spring:
 
   threads:
     virtual:
-      enabled: ${VIRTUAL_THREADS_ENABLED:false}
+      enabled: ${VIRTUAL_THREADS_ENABLED:true}
 
   main:
     keep-alive: true
@@ -26,7 +26,7 @@ spring:
     password: ${SPRING_RABBITMQ_PASSWORD:notification}
     listener:
       simple:
-        prefetch: ${RABBITMQ_PREFETCH:250}
+        prefetch: ${RABBITMQ_PREFETCH:50}
     publisher-confirm-type: correlated
     publisher-returns: true
     template:
@@ -52,6 +52,8 @@ management:
   endpoint:
     health:
       show-details: always
+      probes:
+        enabled: true
 
   metrics:
     tags:
@@ -72,6 +74,6 @@ outbox:
 
 notification:
   rate-limit:
-    push: ${PUSH_RATE_LIMIT:1000}
-    sms: ${SMS_RATE_LIMIT:5}
-    email: ${EMAIL_RATE_LIMIT:1000}
+    push: ${PUSH_RATE_LIMIT:100}
+    sms: ${SMS_RATE_LIMIT:20}
+    email: ${EMAIL_RATE_LIMIT:50}
