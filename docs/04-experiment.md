@@ -684,41 +684,127 @@ Cache 장애가 Notification API 실패로 직접 전파되지 않도록 구성�
 
 ## 13. Platform Thread와 Virtual Thread 비교
 
-실제 블로킹 I/O가 존재하는 경우 반드시 수행한다.
+### 실험 목적
 
-### 실험 A
+현재 Notification API는 RabbitMQ 비동기화를 통해 Provider 호출을 HTTP 요청 경로에서 제거했지만,   
+DB, Redis, RabbitMQ 등 Blocking I/O는 여전히 존재한다.
+
+Java 25의 Virtual Thread를 적용했을 때   
+Platform Thread 대비 API 처리량과 응답 시간이 개선되는지 확인했다.   
+
+두 실험에서는 다음 조건을 동일하게 유지했다.
+
+- Java 25
+- Consumer Concurrency: 5
+- RabbitMQ Prefetch: 50
+- HikariCP Maximum Pool Size: 10
+- 테스트 시간: 30초
+- 동일한 API 요청
+- 매 요청마다 새로운 `eventId` 사용
+- Error Rate 측정
+
+Platform Thread와 Virtual Thread 설정만 변경했다.
+
+### 100 VU 결과
+
+Platform Thread는 실행 편차를 확인하기 위해 두 차례 측정했으며,   
+두 결과의 평균과 Virtual Thread 결과를 비교했다.
+
+| 지표 | Platform Thread 평균 | Virtual Thread | 변화 |
+|---|---:|---:|---:|
+| RPS | 486.91 | 544.44 | 11.8% 증가 |
+| Avg | 204.63ms | 182.98ms | 10.6% 감소 |
+| Median | 162.10ms | 136.96ms | 15.5% 감소 |
+| p90 | 375.00ms | 265.36ms | 29.2% 감소 |
+| p95 | 530.48ms | 447.01ms | 15.7% 감소 |
+| p99 | 1.04s | 876.14ms | 15.8% 감소 |
+| Error Rate | 0% | 0% | 동일 |
+
+100 VU에서는 Virtual Thread 적용 후   
+RPS가 약 11.8% 증가했고 p95는 약 15.7% 감소했다.
+
+### 200 VU 결과
+
+| 지표 | Platform Thread | Virtual Thread | 변화 |
+|---|---:|---:|---:|
+| RPS | 542.68 | 579.90 | 6.9% 증가 |
+| Avg | 366.23ms | 343.40ms | 6.2% 감소 |
+| Median | 306.27ms | 285.34ms | 6.8% 감소 |
+| p90 | 688.43ms | 590.98ms | 14.2% 감소 |
+| p95 | 874.41ms | 812.74ms | 7.1% 감소 |
+| p99 | 1.69s | 1.06s | 37.3% 감소 |
+| Error Rate | 0% | 0% | 동일 |
+
+200 VU에서도 Virtual Thread의 처리량과 응답 시간이 소폭 개선되었다.
+
+특히 p99는 1.69초에서 1.06초로 감소하여   
+높은 동시 요청 환경에서 Tail Latency 개선이 관찰되었다.
+
+### HikariCP 병목
+
+100 VU와 200 VU 모두 HikariCP Maximum Pool Size는 10이었다.
+
+100 VU에서는 약 90개의 Connection Pending,   
+200 VU에서는 약 190개의 Connection Pending이 관찰되었다.
 
 ```text
-Java 25 + Platform Thread
-VIRTUAL_THREADS_ENABLED=false
-````
+100 VU
 
-### 실험 B
+약 10개 → DB Connection 사용
+약 90개 → Connection 대기
 
-```text
-Java 25 + Virtual Thread
-VIRTUAL_THREADS_ENABLED=true
+
+200 VU
+
+약 10개 → DB Connection 사용
+약 190개 → Connection 대기
 ```
 
-### 비교 지표
+Virtual Thread는 Blocking 중 Thread 점유 비용을 줄일 수 있지만,   
+DB Connection Pool의 크기 자체를 증가시키지는 않는다.
 
-| 지표         | Platform Thread | Virtual Thread | 분석 |
-| ---------- | --------------: | -------------: | -- |
-| RPS        |                 |                |    |
-| p95        |                 |                |    |
-| p99        |                 |                |    |
-| CPU        |                 |                |    |
-| Heap       |                 |                |    |
-| 활성 스레드     |                 |                |    |
-| DB Pool 대기 |                 |                |    |
-| 오류율        |                 |                |    |
+따라서 Virtual Thread 적용 후 일부 성능 개선은 확인했지만,   
+DB Connection Pool이 먼저 포화되면서 개선 폭은 제한적이었다.
+
+### Saturation 확인
+
+Virtual Thread 기준 VU를 100에서 200으로 두 배 증가시켰지만   
+RPS는 544.44에서 579.90으로 약 6.5% 증가하는 데 그쳤다.
+
+반면 평균 응답 시간은 182.98ms에서 343.40ms,   
+p95는 447.01ms에서 812.74ms로 크게 증가했다.
+
+따라서 현재 환경에서는 동시 요청을 추가해도   
+처리량보다 Connection 대기 시간이 증가하는 Saturation 상태가 발생한 것으로 판단했다.
 
 ### 결론
 
-* 가상 스레드가 효과적이었던 구간:
-* 효과가 제한된 이유:
-* 외부 시스템의 병목:
-* 최종 선택:
+Virtual Thread 적용 후 100 VU에서는 Platform Thread 대비   
+약 11.8%의 RPS 증가와 약 15.7%의 p95 감소가 관찰되었다.
+
+200 VU에서도 약 6.9%의 RPS 증가와 약 7.1%의 p95 감소가 나타났다.
+
+그러나 두 환경 모두 HikariCP Connection Pool이 최대 10개로 포화되었으며,   
+Virtual Thread 적용만으로 DB가 동시에 처리할 수 있는 요청 수가 증가하지는 않았다.
+
+따라서 Virtual Thread는 Blocking I/O 대기 비용을 줄이는 데 효과가 있었지만,   
+시스템 전체 처리량은 DB Connection Pool과 같은 외부 자원의 처리 한계에 의해 제한되었다.
+
+이번 실험을 통해 Virtual Thread는 단순히 활성화한다고   
+시스템 처리량이 크게 증가하는 기술이 아니라,   
+실제 병목이 Thread 대기 비용에 있을 때 효과가 크다는 점을 확인했다.
+
+<p>100 VU Platform Thread</p>
+<img src="./images/platform-thread-100vu.png">
+
+<p>100 VU Virtual Thread</p>
+<img src="./images/virtual-thread-100vu.png">
+
+<p>200 VU Platform Thread</p>
+<img src="./images/platform-thread-200vu.png">
+
+<p>200 VU Virtual Thread</p>
+<img src="./images/virtual-thread-200vu.png">
 
 ## 14. 실험 한계
 
