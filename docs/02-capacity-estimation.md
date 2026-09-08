@@ -66,15 +66,21 @@ Email        = 5M deliveries/day
 ≈ 5.8TB/year
 ```
 
-실제 저장량은 메시지 본문 저장 여부, Delivery Log, 인덱스 및 보관 기간에 따라 증가할 수 있다.
+위 계산은 Notification 단위의 단순 최소 추정치이다.
+
+실제 구현에서는 하나의 Notification이 여러 Delivery를 생성하고,   
+각 Delivery마다 OutboxEvent와 전송 상태가 추가되므로   
+실제 저장량은 이보다 커질 수 있다.
+
+정확한 저장량은 메시지 본문 크기, 인덱스, 보관 기간과   
+Delivery/Outbox retention 정책을 기준으로 별도 산정해야 한다. 
 
 ## 5. 캐시 
 
 주요 캐시 대상:
-* 사용자 연락처 정보
-* Device Token
-* 알림 On/Off 설정
-* 알림 템플릿
+* Preference Cache
+* Dedup Response Cache
+* Rate Limit Counter
 
 정확한 캐시 크기와 TTL은 구현 및 실험 단계에서 결정한다.
 
@@ -106,5 +112,3 @@ Email        = 5M deliveries/day
 | 일일 Delivery         |     약 26M |
 | 피크 Delivery 처리량     | 약 1,500/s |
 | 연간 저장량 | 약 5.8TB |
-
-````

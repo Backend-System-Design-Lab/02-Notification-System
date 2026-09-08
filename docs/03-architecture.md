@@ -4,9 +4,11 @@
 
 - Push, SMS, Email 알림을 하나의 시스템에서 처리한다.
 - 외부 Provider의 지연과 장애가 API 서버로 전파되지 않도록 한다.
-- 알림 요청을 유실하지 않고 실패한 전송을 재처리한다.
-- 중복 요청 및 중복 전송을 최소화한다.
-- API Server와 Worker를 수평 확장할 수 있도록 설계한다.
+- 수락한 알림이 DB 저장과 메시지 발행 사이에서 유실되지 않도록 한다.
+- 실패한 전송은 Retry하고 반복 실패는 DLQ로 격리한다.
+- Event ID 기반 멱등성으로 중복 처리를 최소화한다.
+- Redis 장애 시에도 핵심 알림 흐름은 유지한다.
+- API와 Consumer를 수평 확장할 수 있도록 설계한다.
 
 가장 중요한 비기능 요구사항은 **안정성, 확장성, 연성 실시간 처리**이다.
 
@@ -14,100 +16,149 @@
 
 ```mermaid
 flowchart LR
-    Client[Internal Service]
-    API[Notification API]
-    DB[(MySQL)]
-    Redis[(Redis)]
-    MQ[RabbitMQ]
+    Client[Internal Service] --> API[Notification API]
 
-    PushQ[Push Queue]
-    SmsQ[SMS Queue]
-    EmailQ[Email Queue]
+    API --> Redis[(Redis)]
+    API --> DB[(MySQL)]
 
-    PushW[Push Worker]
-    SmsW[SMS Worker]
-    EmailW[Email Worker]
+    DB --> Outbox[Outbox Publisher]
+    Outbox --> MQ[RabbitMQ]
 
-    APNS[Mock APNs]
-    FCM[Mock FCM]
-    SMS[Mock SMS Provider]
-    EMAIL[Mock Email Provider]
+    MQ --> PQ[Push Queue]
+    MQ --> SQ[SMS Queue]
+    MQ --> EQ[Email Queue]
 
-    Client --> API
+    PQ --> PC[Push Consumer]
+    SQ --> SC[SMS Consumer]
+    EQ --> EC[Email Consumer]
 
-    API --> DB
-    API --> Redis
-    API --> MQ
+    PC --> RL[Redis Rate Limiter]
+    SC --> RL
+    EC --> RL
 
-    MQ --> PushQ
-    MQ --> SmsQ
-    MQ --> EmailQ
-
-    PushQ --> PushW
-    SmsQ --> SmsW
-    EmailQ --> EmailW
-
-    PushW --> APNS
-    PushW --> FCM
-    SmsW --> SMS
-    EmailW --> EMAIL
+    RL --> PP[Mock Push Provider]
+    RL --> SP[Mock SMS Provider]
+    RL --> EP[Mock Email Provider]
 ````
 
-실제 외부 서비스 대신 Mock Provider를 사용해 지연, 실패, Timeout을 재현한다.
+Notification API는 `Notification`, `NotificationDelivery`, `OutboxEvent`를 같은 DB Transaction에 저장한다.
+
+Outbox Publisher가 `Pending` 이벤트를 RabbitMQ에 발행하고, Broker Confirm과 Return을 확인한 뒤 `PUBLISHED`로 변경한다.
 
 ## 3. 주요 컴포넌트
 
-| 컴포넌트             | 역할                       | 확장 방법               |
-|------------------|--------------------------|---------------------|
-| Notification API | 요청 검증 및 알림 생성            | 수평 확장               | 
-| MySQL            | 사용자, 설정, 알림 상태 저장        | Replica / Partition |       
-| Redis            | 설정 캐시, Rate Limit, 중복 검사 | Scale-out           |       
-| RabbitMQ         | 알림 요청 비동기 전달             | Queue / Consumer 확장 |       
-| Worker           | 채널별 실제 전송 처리             | Consumer 수 증가       |
-| Provider | APNs, FCM, SMS, Email 역할 | 외부 서비스 |
+| 컴포넌트             | 역할                                                 |
+|------------------|----------------------------------------------------|
+| Notification API | 요청 검증, 멱등성 확인, 알림 접수                               | 
+| MySQL            | 사용자, Preference, Notification, Delivery, Outbox 저장 |      
+| Redis            | Preference Cache, Dedup Cache, Rate Limit          |   
+| Outbox Publisher | PENDING OutboxEvent를 RabbitMQ에 발행                  |
+| RabbitMQ         | 채널별 비동기 메시지 전달                                     | 
+| Consumer         | Provider 호출 및 Delivery 상태 변경                       |
+| Retry Queue      | 일시적 Provider 실패 재시도                                |
+| DLQ              | 반복 실패 메시지 격리                                       |
+| Mock Provider    | 외부 Provider 지연, 실패 재현                              |
+
 
 ## 4. 요청 흐름
 
-### 정상 흐름
-
-1. 내부 서비스가 알림 API를 호출한다.
-2. API 서버가 요청과 Event ID를 검증한다.
-3. 사용자 정보와 알림 설정을 조회한다.
-4. 알림 정보를 DB에 저장한다.
-5. 채널별 메시지를 Queue에 전달한다.
-6. Worker가 메시지를 가져온다.
-7. 템플릿을 적용하고 외부 Provider로 전송한다.
-8. 전송 결과를 DB에 기록한다.
-
-### 실패 흐름
-
+### 알림 접수
 ```text
-Worker
-  ↓
-Provider 호출 실패
-  ↓
-Retry
-  ↓
-반복 실패
-  ↓
-DLQ
+POST /api/v1/notifications
+        ↓
+Redis Dedup
+        ↓
+사용자 / Preference 조회
+        ↓
+DB Transaction
+ ├─ Notification
+ ├─ Delivery
+ └─ OutboxEvent
+        ↓
+202 Accepted
 ```
 
-일시적 장애는 재시도하고 최대 재시도 횟수를 초과하면 DLQ로 이동한다.
+동일 `eventId`는 Redis에서 빠르게 응답하고, Redis MISS 또는 장애 시 MySQL의 `event_id UNIQUE`를 최종 기준으로 사용한다.
 
-## 5. 데이터 모델
+### 메시지 발행과 전송
+```text
+Outbox PENDING
+      ↓
+RabbitMQ Publish
+      ↓
+채널별 Queue
+      ↓
+Consumer
+      ↓
+Rate Limit
+      ↓
+Provider
+      ↓
+Delivery / Notification 상태 갱신
+```
+
+하나의 Notification은 여러 Delivery를 만들 수 있다.
+
+```text
+Push Device 2개
+SMS 1개
+Email 1개
+→ 총 4 Delivery
+```
+
+## 5. 실패 흐름
+
+### Provider 실패
+```text
+Provider 실패
+   ↓
+Retry Queue
+   ↓
+재시도
+   ↓
+최대 3회 실패
+   ↓
+DLQ
+   ↓
+Delivery / Notification FAILED
+```
+
+### RabbitMQ 장애
+```text
+DB Commit
+   ↓
+Outbox PENDING
+   ↓
+Publish 실패
+   ↓
+RabbitMQ 복구
+   ↓
+재발행
+```
+
+Publish가 반복 실패하면 최대 5회 이후 Outbox와 Delivery를 `FAILED`로 전환한다.
+
+### Redis 장애
+| 기능 | 장애 시 처리 |
+|-----| ----------|
+| Preference Cache | MySQL Fallback |
+| Dedup Cache | MySQL 조회 + `event_id UNIQUE` |
+| Rate Limit | Fail-open |
+
+Redis는 Source of Truth가 아니며, 정합성의 최종 기준은 MySQL이다.
+
+## 6. 데이터 모델
 
 ### 주요 엔티티
 
-| 엔티티  | 주요 필드                  | 설명      |
-|------|------------------------|---------|
-| User | id, email, phoneNumber | 사용자 연락처 |
-| UserDevice | id, userId, platform, token | 사용자 단말 | 
-| NotificationPreference | userId, channel, enalbed | 채널별 알림 설정 |
-| NotificationTemplate | templateKey, channel, content | 알림 템플릿 |
-| Notification | id, eventId, userId, status | 논리적 알림 |
-| NotificationDelivery | noptificationId, channel, destination, status | 실제 전송 |
-| OutboxEvent | eventId, payload, status | 메시지 유실 방지 |
+| 엔티티  | 주요 필드                                                      | 설명        |
+|------|------------------------------------------------------------|-----------|
+| User | id, email, phoneNumber                                     | 사용자       |
+| UserDevice | id, userId, platform, token                                | Push 단말   | 
+| NotificationPreference | userId, channel, enabled                                   | 채널별 알림 설정 |
+| Notification | id, eventId, userId, status                                | 논리적 알림    |
+| NotificationDelivery | notificationId, channel, destination, status, attemptCount | 실제 전송     |
+| OutboxEvent | notificationId, deliveryId, channel, status, attemptCount  | 메시지 발행 보장 |
 
 ### 관계
 
@@ -117,87 +168,82 @@ erDiagram
     USER ||--o{ NOTIFICATION_PREFERENCE : has
     USER ||--o{ NOTIFICATION : receives
     NOTIFICATION ||--o{ NOTIFICATION_DELIVERY : produces
+    NOTIFICATION_DELIVERY ||--|| OUTBOX_EVENT : publishes
 ```
 
-## 6. API 설계
+## 7. API 설계
 
-| Method | Endpoint                   | 설명       | 멱등성         |
-| ------ |----------------------------|----------|-------------|
-| GET    | /api/v1/notifications/{id} | 알림 상태 조회 | Yes         |
-| POST   | /api/v1/notifications      | 알림 전송 요청 | Event ID 기반 |
-| PUT | /api/v1/users/{id}/preferences | 알림 설정 변경 | Yes |
+| Method | Endpoint                                                  | 설명                     |
+|-------|-----------------------------------------------------------|------------------------|
+| POST  | /api/v1/notifications                                     | 알림 요청, Event ID 기반 멱등성 |
+| PATCH | /api/v1/users/{userId}/notification-preferences/{channel} | 채널 알림 설정 변경            |
 
-## 7. 핵심 설계 결정
+POST는 실제 Provider 전송 완료를 기다리지 않고 `202 Accepted`를 반환한다.
 
-### 결정 1. 메시지 큐 기반 비동기 처리
-
-#### 문제
-
-외부 Provider 호출을 API 요청에서 직접 수행하면 Provider의 지연과 장애가 API 처리량에 영향을 준다.
-
-#### 선택
-
-RabbitMQ를 이용해 요청 수신과 실제 알림 전송을 분리한다.
+Preference 변경은 DB를 먼저 갱신한 뒤 Cache를 Evict한다.
 ```text
-API → Queue → Worker → Provider
+DB UPDATE + COMMIT
+→ Redis Cache Evict
+→ 다음 요청에서 최신 값 재캐싱
 ```
 
-#### 트레이드오프
+## 8. 핵심 설계 결정
 
-* 장점: 외부 장애 격리, Traffic Buffer, Worker 수평 확장
-* 단점: 구조 복잡도 증가, 즉시 전송 결과 확인 불가
-
-### 결정 2. 채널별 Queue와 Worker 분리
+### 1. RabbitMQ 비동기 처리
 ```text
-Push Queue  → Push Worker
-SMS Queue   → SMS Worker
-Email Queue → Email Worker
+API → Outbox → RabbitMQ → Consumer → Provider
 ```
-SMS Provider가 느려져도 Push와 Email 처리에는 영향을 주지 않도록 한다.
+Provider 지연과 장애를 API 요청 경로에서 분리하고 Queue를 Traffic Buffer로 사용한다.
 
-### 결정 3. At-least-once + Idempotency
-메시지 유실을 피하기 위해 At-least-once 전달을 기본으로 한다.
+### 2. Transactional Outbox
 
-그 과정에서 발생할 수 있는 중복은 `eventId` 기반 멱등성 처리로 최소화한다.
+DB Commit과 RabbitMQ Publish는 하나의 Transaction이 아니므로 그 사이의 메시지 유실을 막기 위해 사용한다.
 
-완벽한 Exactly-once 전송은 외부 Provider까지 포함하면 보장하기 어렵다.
+### 3. 채널별 Queue
 
-## 8. 데이터 정합성
+Push, SMS, Email을 분리해 특정 Provider의 지연이나 장애가 다른 채널에 직접 영향을 주지 않도록 한다.
 
-* Notification 저장과 메시지 발행 사이의 유실 방지를 위해 Transactional Outbox를 사용한다.
-* `eventId`에 Unique 제약을 두어 동일 요청을 방지한다.
-* DB를 사용자 정보와 알림 설정의 Source of Truth로 사용한다.
-* Redis는 캐시 및 부가 기능으로 사용한다.
+### 4. At-least-once + Idempotency
 
-## 9. 장애 대응
+Exactly-once 대신 At-least-once를 기본으로 하고 Event ID와 Delivery 상태로 중복 가능성을 줄인다.
 
-| 장애 상황       | 대응 방법                  |
-|-------------|------------------------|
-| API 서버 장애   | Stateless 구성 후 수평확장    |
-| Provider 장애 | Retry + DLQ            |
-| Worker 장애   | Queue 메시지 재처리          |
-| Redis 장애    | DB 조회로 처리 가능하도록 구성     |
-| RabbitMQ 장애 | 운영 환경에서는 Cluster 구성 고려 |
+### 5. Redis는 보조 계층
 
-## 10. 단일 장애 지점
+Preference Cache, Dedup, Rate Limit에 사용하지만 Redis 장애가 알림 서비스 중단으로 이어지지 않도록 Fallback 또는 Fail-open을 적용한다.
 
-로컬 실험 환경에서는 MySQL, Redis, RabbitMQ를 각각 단일 인스턴스로 사용한다.
+## 9. 최종 설정
 
-운영 환경에서는 다음 방법을 고려한다.
+| 항목                         | 값 |
+|----------------------------| ---|
+| HikariCP Maximum Pool Size | 10 |
+| Consumer Concurrency       | 5 |
+| RabbitMQ Prefetch          | 50 |
+| Push Rate Limit            | 100/s |
+| SMS Rate Limit             | 20/s |
+| Email Rate Limit           | 50/s |
+| Preference Cache TTL       | 30분 |
+| Redis Timeout              | 300ms |
+| Outbox Publish Interval    | 1초 |
 
+## 10. 운영 환경에서 추가할 사항
+
+* API와 Worker 프로세스 분리 및 수평 확장
 * MySQL Replica / Failover
-* Redis Sentinel 또는 Cluster
 * RabbitMQ Cluster
-* 다중 Notification API / Worker
+* Redis Sentinel 또는 Cluster
+* Load Balancer
+* 중앙 로그 및 Alerting
+* Outbox / Delivery Retention 정책
 
-## 11. 관측 가능성
+## 11. 관측 지표
 
-주요 지표:
-* API RPS / p95 / p99
-* Queue Depth
-* Enqueue / Consume Rate
-* Worker 처리량
-* Retry Rate
-* DLQ 메시지 수
-* Provider Latency / Error Rate
+* API RPS / p95 / p99 / Error Rate
+* HikariCP Active / Pending
+* RabbitMQ Ready / Unacked / Ack Rate
+* Consumer 처리량
+* Retry / DLQ
+* Redis Hit / Miss / Error
+* Outbox PENDING / PUBLISHED / FAILED
 * End-to-End Delivery Latency
+
+비동기 구조에서는 **API RPS와 실제 Delivery 처리량**을 분리해서 해석한다.

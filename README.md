@@ -1,411 +1,251 @@
 # Notification System
 
-Spring Boot 기반 시스템 설계 프로젝트를 빠르게 시작하고,
-부하 테스트와 모니터링을 통해 설계 선택을 검증하기 위한 공통 템플릿입니다.
+>  Backend System Design Lab — Week 2
 
-새로운 시스템 설계 주제를 진행할 때 이 Repository를 기반으로 별도의 Repository를 생성하고, 프로젝트별로 필요한 데이터베이스, 캐시, 메시지 브로커 등을 추가합니다.
+Push, SMS, Email 알림 시스템을 구현한 뒤 부하와 장애를 직접 만들어보면서 구조를 단계적으로 개선한 프로젝트입니다.
 
-## 목표
+## 프로젝트 소개
 
-- 공통 Spring Boot 실행 환경 제공
-- Docker Compose 기반 로컬 실험 환경 제공
-- k6 기반 부하 테스트 시나리오 제공
-- Prometheus와 Grafana 기반 메트릭 관측
-- 설계 및 실험 과정을 동일한 문서 형식으로 기록
-- Platform Thread와 Virtual Thread 비교 환경 제공
+처음에는 Notification API가 DB Transaction 안에서 Mock Provider를 동기 호출했습니다.   
+
+50 VU에서 HikariCP 10개가 모두 사용되고 약 40개의 요청이 Connection을 기다리면서   
+RPS는 23.55, p95는 3.80초까지 증가했습니다.
+
+이후 Transaction Boundary 분리, RabbitMQ 비동기 처리,   
+Consumer Concurrecny / Prefetch 튜닝, Redis Cache,   
+Retry / DLQ, Transactional Outbox를 순서대로 적용하고 같은 방식으로 측정했습니다.
+
+```text
+Synchronous Provider Call
+→ Transaction Boundary 분리
+→ RabbitMQ Async
+→ Consumer Concurrency / Prefetch 튜닝
+→ Redis Preference Cache / Dedup / Rate Limit
+→ Retry / DLQ
+→ Transactional Outbox
+→ Virtual Thread 비교
+```
+
+## 핵심 결과
+
+| 실험 | 결과 |
+| --- | --- |
+| Transaction Boundary | 50 VU RPS 23.55 → 117.74 |
+| RabbitMQ Async | 50 VU RPS 117.74 → 511.23 |
+| 응답 지연 | Baseline p95 3.80s → Async p95 266.21ms |
+| Consumer Concurrency | Queue당 Ack Rate 약 9 → 44 → 89 msg/s |
+| 최종 Consumer 설정 | Concurrency 5, Prefetch 50 |
+| Preference Cache | RPS 180.51 → 513.69, p95 93.51ms → 18.27ms |
+| Dedup Cache | RPS 1,044.11 → 3,957.98, p95 93.51ms → 18.27ms |
+| Virtual Thread | 200 VU p99 1.69s → 1.06s |
+| Retry / DLQ | Provider 3회 실패 후 FAILED 및 DLQ |
+| Transactional Outbox | RabbitMQ 장애 시 PENDING 보존 후 복구 시 재발행 |
 
 ## 기술 스택
 
-| 구분 | 기술 |
-|---|---|
-| Language | Java 25 |
-| Framework | Spring Boot 4.1 |
-| Build | Gradle |
-| API | Spring MVC |
-| Metrics | Spring Boot Actuator, Micrometer |
-| Load Test | k6 |
-| Monitoring | Prometheus, Grafana |
-| Container | Docker, Docker Compose |
+| 구분                 | 기술 |
+|--------------------| --- |
+| Application        | Java 25, Spring Boot 4.1, Spring Data JPA |
+| Database           | MySQL 8.4 |
+| Cache / Rate Limit | Redis 7.4 |
+| Message Broker     | RabbitMQ 4 |
+| Monitoring         | Spring Boot Actuator, Micrometer, Prometheus, Grafana |
+| Performance Test | k6 |
+| Infrastructure | Docker, Docker Compose |
 
-## Java 25 선택 이유
+## 아키텍처
 
-Java 25는 가상 스레드가 정식 기능으로 제공된 Java 21 이후의 개선 사항을 포함하는 LTS 버전입니다.
+현재 구현에서는 Notification API와 RabbitMQ Consumer가 동일한 Spring Boot Application에서 실행됩니다.
+```text
+                  Internal Service
+                         │
+                 Notification API
+                         │
+          ┌──────────────┴──────────────┐
+          │                             │
+        Redis                         MySQL
+ Preference / Dedup /          Notification / Delivery
+    Rate Limit                    / OutboxEvent
+                                        │
+                                Outbox Publisher
+                                        │
+                                    RabbitMQ
+                      ┌─────────────────┼─────────────────┐
+                  Push Queue         SMS Queue        Email Queue
+                      │                 │                 │
+               Push Consumer      SMS Consumer      Email Consumer
+                      │                 │                 │
+                    Mock Provider / External Provider
 
-시스템 설계 프로젝트에서는 데이터베이스, Redis, 메시지 브로커, 외부 API처럼 블로킹 I/O가 자주 발생합니다. 따라서 동기식 Spring MVC 구조를 유지하면서 Platform Thread와 Virtual Thread의 동시 처리 성능을 비교하기 위해 Java 25를 사용합니다.
-
-가상 스레드는 기본적으로 비활성화되어 있으며 환경변수로 전환합니다.
-
-```dotenv
-VIRTUAL_THREADS_ENABLED=false
 ```
 
-실제 블로킹 I/O가 포함된 프로젝트에서는 동일한 k6 시나리오로 다음 실험을 수행합니다.
+운영 환경에서는 API와 Consumer Worker를 별도 프로세스로 분리하고   
+채널별 Worker를 독립적으로 수평 확장하는 구조를 고려합니다.
+
+## 주요 설계
+
+### RabbitMQ 비동기 처리
+
+초기에는 Provider 호출이 HTTP 요청 경로에 포함되어 있었습니다.
 
 ```text
-실험 A: Java 25 + Platform Thread
-실험 B: Java 25 + Virtual Thread
+HTTP Request
+→ DB 저장
+→ Provider 호출
+→ HTTP Response
 ```
 
-비교 지표:
-
-- RPS
-- p95 및 p99 응답 시간
-- 오류율
-- CPU 사용률
-- JVM Heap
-- 활성 스레드 수
-- DB Connection Pool 대기
-
-## 전체 구조
-
-```mermaid
-flowchart LR
-    K6[k6]
-    APP[Spring Boot]
-    ACTUATOR[Actuator / Micrometer]
-    PROMETHEUS[Prometheus]
-    GRAFANA[Grafana]
-
-    K6 -->|HTTP Load| APP
-    APP --> ACTUATOR
-    PROMETHEUS -->|Scrape| ACTUATOR
-    GRAFANA -->|PromQL| PROMETHEUS
-```
-
-## 디렉터리 구조
+RabbitMQ 적용 후:
 
 ```text
-.
-├── src
-│   ├── main
-│   └── test
-├── k6
-│   ├── smoke-test.js
-│   ├── load-test.js
-│   └── stress-test.js
-├── monitoring
-│   ├── prometheus
-│   │   └── prometheus.yml
-│   └── grafana
-│       ├── dashboards
-│       └── provisioning
-├── docs
-│   ├── 01-requirements.md
-│   ├── 02-capacity-estimation.md
-│   ├── 03-architecture.md
-│   ├── 04-experiment.md
-│   └── 05-retrospective.md
-├── scripts
-├── Dockerfile
-├── docker-compose.yml
-└── README.md
+HTTP Request
+→ DB 저장
+→ Outbox
+→ 202 Accepted
+
+RabbitMQ
+→ Consumer
+→ Provider
 ```
 
-## 제공 API
+Provider 지연과 장애를 API 요청 경로에서 분리했습니다.
 
-### Ping
+### Consumer Concurrency / Prefetch
 
-애플리케이션 실행 여부와 기본 HTTP 메트릭을 확인하기 위한 API입니다.
+Concurrency를 1, 5, 10으로 비교했을 때 Queue당 Ack Rate는   
+약 9, 44, 89 msg/s로 증가했습니다.
 
-```http
-GET /api/v1/ping
+Concurrency 10에서는 CPU와 HikariCP 경합이 커져   
+현재 단일 인스턴스에서는 **Concurrency 5**를 선택했습니다.
+
+Prefetch는 10, 50, 250을 비교했습니다.
+
+Prefetch 50 이후 실제 Ack Rate는 거의 증가하지 않았지만   
+Unacked 메시지는 크게 늘어 최종값을 **50**으로 선택했습니다.
+
+### Redis
+
+Redis는 Source of Truth가 아니라 보조 계층으로 사용합니다.
+
+```text
+Preference Cache
+→ 반복 DB 조회 감소
+
+Dedup Cache
+→ 동일 Event ID 중복 요청 빠른 응답
+
+Rate Limit
+→ Provider 보호
 ```
 
-응답:
-
-```json
-{
-  "message": "pong"
-}
+Redis 장애 시:
+```text
+Preference Cache → MySQL Fallback
+Dedup Cache      → MySQL + event_id UNIQUE
+Rate Limit       → Fail-open
 ```
 
-## 실행 전 요구사항
-
-- Docker Desktop
-- Docker Compose v2
-- Java 25
-- Python 3
-- Git
-
-Docker Compose를 사용하면 로컬 Java와 Gradle이 없어도 전체 환경을 실행할 수 있습니다.
-
-## 새 프로젝트 시작하기
-
-GitHub의 `Use this template`로 Repository를 생성한 뒤 Clone합니다.
-
-```bash
-./scripts/init-project.sh \
-  url-shortener \
-  com.backendsystemdesignlab.urlshortener \
-  "URL Shortener"
+### Retry / DLQ
+```text
+Provider 실패
+→ Retry Queue
+→ TTL
+→ 원 Queue 재진입
+→ 최대 3회 실패
+→ DLQ
 ```
+
+일시적 장애는 재시도하고 반복 실패는 DLQ로 격리합니다.
+
+### Transactional Outbox
+
+DB 저장과 RabbitMQ Publish 사이의 메시지 유실을 방지합니다.
+
+```text
+DB Transaction
+├─ Notification
+├─ Delivery
+└─ OutboxEvent PENDING
+        │
+        ↓
+Outbox Publisher
+        │
+        ↓
+RabbitMQ Publish
+        │
+        ↓
+PUBLISHED
+```
+
+RabbitMQ 장애 시 `PENDING` 상태를 유지하고 복구 후 다시 발행합니다.
+
+### At-least-once + Idempotency
+
+외부 Provider까지 포함한 Exactly-once 대시    
+At-least-once 전달을 기본으로 두고 Event ID 기반 멱등성으로 중복을 줄였습니다.
+
 
 ## 실행 방법
 
-### 1. 환경변수 파일 생성
+### 사전 요구사항
+* Java 25
+* Docker / Docker Compose
+* k6
 
+### 환경 실행 
 ```bash
-cp .env.example .env
+docker compose up -d --build
 ```
 
-기본 설정:
-
-```dotenv
-APP_NAME=notification-system
-
-APP_PORT=8080
-PROMETHEUS_PORT=9090
-GRAFANA_PORT=3000
-
-GRAFANA_ADMIN_USER=admin
-GRAFANA_ADMIN_PASSWORD=admin
-
-VIRTUAL_THREADS_ENABLED=false
-```
-
-기본 Grafana 계정은 로컬 실험용입니다. 외부 환경에서는 반드시 변경해야 합니다.
-
-### 2. 전체 환경 실행
-
-```bash
-./scripts/start.sh
-```
-
-직접 실행하려면:
-
-```bash
-docker compose up --build -d
-```
-
-### 3. 실행 상태 확인
-
+상태 확인:
 ```bash
 docker compose ps
+curl http://localhost:8080/actuator/health
 ```
 
-Spring Boot 컨테이너가 다음 상태여야 합니다.
-
-```text
-healthy
-```
-
-### 4. 서비스 접속
-
-| 서비스 | 주소 |
-|---|---|
-| Spring Boot | http://localhost:8080 |
-| Health Check | http://localhost:8080/actuator/health |
-| Prometheus Metrics | http://localhost:8080/actuator/prometheus |
-| Prometheus | http://localhost:9090 |
-| Grafana | http://localhost:3000 |
-
-Grafana 기본 계정:
-
-```text
-ID: admin
-Password: admin
-```
-
-## 부하 테스트
-
-k6는 상시 실행하지 않고 테스트 시 일회성 컨테이너로 실행됩니다.
-
-### Smoke Test
-
-API가 기본적으로 정상 동작하는지 검증합니다.
-
+### API
+알림 요청: 
 ```bash
-./scripts/run-smoke-test.sh
+curl -X POST http://localhost:8080/api/v1/notifications \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "eventId": "notification-001",
+    "userId": 1,
+    "channels": ["PUSH", "SMS", "EMAIL"]
+  }'
 ```
 
-기준:
-
-- HTTP 실패율 1% 미만
-- p95 500ms 미만
-- Check 성공률 99% 초과
-
-### Load Test
-
-예상 부하에서 성능 기준을 만족하는지 검증합니다.
-
+Preference 변경:
 ```bash
-./scripts/run-load-test.sh
+curl -X PATCH \
+  http://localhost:8080/api/v1/users/1/notification-preferences/SMS \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled": false}'
 ```
-
-기준:
-
-- HTTP 실패율 1% 미만
-- p95 200ms 미만
-- p99 500ms 미만
-
-### Stress Test
-
-부하 증가에 따라 시스템이 어느 지점에서 불안정해지는지 관찰합니다.
-
-```bash
-./scripts/run-stress-test.sh
-```
-
-Stress Test에서는 다음 변화를 확인합니다.
-
-- 처리량 증가 또는 정체
-- p95 및 p99 급증
-- 5xx 오류 발생
-- CPU 사용률 상승
-- JVM Heap 및 GC 변화
-
-## 모니터링
-
-Grafana에서 다음 경로로 이동합니다.
-
-```text
-Dashboards
-→ System Design
-→ Spring Boot Overview
-```
-
-기본 대시보드에서 다음 지표를 확인할 수 있습니다.
-
-- Requests Per Second
-- p95 Response Time
-- p99 Response Time
-- 5xx Error Rate
-- JVM Heap Used
-- Process CPU Usage
-
-Prometheus Target 상태:
-
-```text
-http://localhost:9090/targets
-```
-
-`spring-boot` Target이 `UP`이어야 합니다.
-
-## 애플리케이션 직접 실행
 
 ### 테스트
-
 ```bash
 ./gradlew clean test
 ```
 
-### 실행
-
-```bash
-./gradlew bootRun
-```
-
-### JAR 빌드
-
-```bash
-./gradlew clean bootJar
-```
-
-결과:
-
-```text
-build/libs/app.jar
-```
-
-## 종료 및 정리
-
-### 서비스 종료
-
-```bash
-./scripts/stop.sh
-```
-
-Prometheus와 Grafana의 Named Volume은 유지됩니다.
-
-### 컨테이너와 빌드 결과 정리
-
-```bash
-./scripts/clean.sh
-```
-
-### 수집 데이터까지 완전히 삭제
-
-```bash
-./scripts/clean.sh --volumes
-```
-
-`--volumes`를 사용하면 Prometheus와 Grafana의 저장 데이터가 삭제됩니다.
-
-## 프로젝트 진행 절차
-
-각 시스템 설계 프로젝트는 다음 순서로 진행합니다.
-
-1. 문제 및 요구사항 정의
-2. 용량 산정
-3. 초기 아키텍처 설계
-4. Baseline 구현
-5. 부하 테스트
-6. 병목 분석
-7. 구조 개선
-8. 동일한 조건으로 재측정
-9. 결과 및 트레이드오프 정리
-10. 회고 작성
+상세 실험 스크립트와 결과는 `k6/`, `scripts/`, `docs/04-experiment.md`에서 확인할 수 있습니다.
 
 ## 문서
 
 | 문서 | 내용 |
 |---|---|
-| [Requirements](docs/01-requirements.md) | 기능 및 비기능 요구사항 |
-| [Capacity Estimation](docs/02-capacity-estimation.md) | 트래픽, 저장량, 네트워크 산정 |
-| [Architecture](docs/03-architecture.md) | 전체 구조와 설계 결정 |
-| [Experiment](docs/04-experiment.md) | Baseline 및 개선 실험 |
-| [Retrospective](docs/05-retrospective.md) | 결과, 한계, 회고 |
+| [Requirements](docs/01-requirements.md) | 범위와 성공 기준 |
+| [Capacity](docs/02-capacity-estimation.md) | 트래픽, 저장량, 예상 병목 |
+| [Architecture](docs/03-architecture.md) | 최종 구조와 설계 판단 |
+| [Experiment](docs/04-experiment.md) | 부하, 병목, 장애 실험 결과 |
+| [Retrospective](docs/05-retrospective.md) | 문제 해결 과정과 면접용 정리 |
 
-## 템플릿 사용 방법
+## 후속 과제
 
-GitHub Repository 화면에서 다음을 선택합니다.
-
-```text
-Use this template
-→ Create a new repository
-```
-
-새 Repository 생성 후:
-
-```bash
-cp .env.example .env
-./scripts/start.sh
-./scripts/run-smoke-test.sh
-```
-
-프로젝트별로 다음 항목을 변경합니다.
-
-- `settings.gradle`의 프로젝트 이름
-- `spring.application.name`
-- Java 기본 패키지
-- Docker 이미지 이름
-- README 프로젝트 설명
-- Prometheus와 Grafana의 애플리케이션 식별자
-- 요구사항 및 설계 문서
-
-## 현재 범위
-
-이 템플릿에는 특정 프로젝트에 종속되는 다음 기술을 기본으로 포함하지 않습니다.
-
-- Database
-- Redis
-- Kafka
-- Spring Security
-- JPA
-- QueryDSL
-
-각 시스템 설계 프로젝트에서 필요한 기술만 추가합니다.
-
-## 주의 사항
-
-이 Repository는 로컬 시스템 설계 실험을 위한 템플릿입니다.
-
-현재 구성은 다음 항목을 운영 환경 수준으로 제공하지 않습니다.
-
-- TLS
-- Secret Manager
-- 데이터베이스 이중화
-- 다중 애플리케이션 인스턴스
-- 중앙 로그 수집
-- Alert Manager
-- 백업 및 복구
+* API와 Consumer Worker 분리
+* 채널별 Worker 독립 수평 확장
+* RabbitMQ Cluster 구성
+* MySQL Replica / Failover
+* Redis Sentinel 또는 Cluster
+* End-to-End Delivery Latency 측정
+* 실제 APNs / FCM / SMS / Email Provider 연동
