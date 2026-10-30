@@ -49,13 +49,19 @@ public class OutboxPublisher {
                     event.getDeliveryId(),
                     event.getChannel(),
                     event.getDestination(),
-                    1
+                    event.getDeliveryAttempt()
             );
 
             CorrelationData correlationData = new CorrelationData(String.valueOf(event.getId()));
 
+            String exchange = switch (event.getPublishRoute()) {
+                case MAIN -> RabbitMqConfig.EXCHANGE;
+                case RETRY -> RabbitMqConfig.RETRY_EXCHANGE;
+                case DLQ -> RabbitMqConfig.DLX;
+            };
+
             rabbitTemplate.convertAndSend(
-                    RabbitMqConfig.EXCHANGE,
+                    exchange,
                     routingKey(event),
                     message,
                     correlationData

@@ -15,6 +15,7 @@ services:
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/notification
       SPRING_DATASOURCE_USERNAME: notification
       SPRING_DATASOURCE_PASSWORD: notification
+      SPRING_JPA_HIBERNATE_DDL_AUTO: "none"
       SPRING_RABBITMQ_HOST: rabbitmq
       SPRING_RABBITMQ_PORT: 5672
       SPRING_RABBITMQ_USERNAME: notification
@@ -29,6 +30,7 @@ services:
 
       NOTIFICATION_CONSUMER_ENABLED: "false"
       OUTBOX_PUBLISHER_ENABLED: "true"
+      DELIVERY_RECOVERY_ENABLED: "false"
 
     healthcheck:
       test:
@@ -154,6 +156,7 @@ services:
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/notification
       SPRING_DATASOURCE_USERNAME: notification
       SPRING_DATASOURCE_PASSWORD: notification
+      SPRING_JPA_HIBERNATE_DDL_AUTO: "none"
 
       SPRING_RABBITMQ_HOST: rabbitmq
       SPRING_RABBITMQ_PORT: 5672
@@ -165,6 +168,7 @@ services:
 
       NOTIFICATION_CONSUMER_ENABLED: "true"
       OUTBOX_PUBLISHER_ENABLED: "false"
+      DELIVERY_RECOVERY_ENABLED: "true"
 
       NOTIFICATION_CONSUMER_CONCURRENCY: "${NOTIFICATION_CONSUMER_CONCURRENCY:-5}"
       RABBITMQ_PREFETCH: 50

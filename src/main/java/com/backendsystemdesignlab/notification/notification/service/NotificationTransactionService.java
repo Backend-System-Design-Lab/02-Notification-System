@@ -13,7 +13,6 @@ import com.backendsystemdesignlab.notification.outbox.OutboxEvent;
 import com.backendsystemdesignlab.notification.outbox.OutboxEventRepository;
 import com.backendsystemdesignlab.notification.preference.NotificationPreferenceService;
 import com.backendsystemdesignlab.notification.user.domain.NotificationChannel;
-import com.backendsystemdesignlab.notification.user.domain.NotificationPreference;
 import com.backendsystemdesignlab.notification.user.domain.User;
 import com.backendsystemdesignlab.notification.user.domain.UserDevice;
 import com.backendsystemdesignlab.notification.user.repository.UserDeviceRepository;
@@ -21,9 +20,10 @@ import com.backendsystemdesignlab.notification.user.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import com.backendsystemdesignlab.notification.outbox.OutboxRoute;
 
+import java.time.LocalDateTime;
 import java.util.*;
-import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -118,53 +118,151 @@ public class NotificationTransactionService {
         );
     }
 
+    private static final int MAX_ATTMPTS = 3;
+
     @Transactional
-    public void recordRetryFailure(Long deliveryId) {
+    public Optional<DeliveryClaim> tryClaim(Long deliveryId, int messageAttempt) {
+        if (messageAttempt < 1 || messageAttempt > MAX_ATTMPTS) {
+            return Optional.empty();
+        }
 
-        NotificationDelivery delivery = deliveryRepository.findById(deliveryId)
-                .orElseThrow(() -> new IllegalArgumentException("전송 정보를 찾을 수 없습니다."));
+        String token = UUID.randomUUID().toString();
 
-        if (delivery.getStatus() != DeliveryStatus.PENDING) {
+        int updated = deliveryRepository.claimPending(
+                deliveryId,
+                DeliveryStatus.PENDING,
+                DeliveryStatus.PROCESSING,
+                LocalDateTime.now(),
+                token,
+                messageAttempt - 1,
+                MAX_ATTMPTS
+        );
+
+        if (updated == 0) {
+            return Optional.empty();
+        }
+
+        int attempt = deliveryRepository.findById(deliveryId)
+                .orElseThrow()
+                .getAttemptCount();
+
+        return Optional.of(new DeliveryClaim(token, attempt));
+    }
+
+    public final int MAX_ATTEMPTS = 3;
+
+    @Transactional
+    public void recordRetryFailureAndEnqueue(
+            Long notificationId,
+            Long deliveryId,
+            String token
+    ) {
+        // 1. Notification 먼저 잠금
+        notificationRepository.findByIdForUpdate(notificationId)
+                .orElseThrow(() ->
+                        new IllegalArgumentException("Notification not found")
+                );
+
+        // 2. Delivery 잠금
+        NotificationDelivery delivery = deliveryRepository
+                .findByIdForUpdate(deliveryId)
+                .orElseThrow(() ->
+                        new IllegalArgumentException("Delivery not found")
+                );
+
+        // 3. 선점 토큰 검증
+        if (!delivery.isClaimedBy(token)) {
             return;
         }
 
-        delivery.recordAttempt();
+        // 4. 재시도 횟수 확인
+        if (delivery.getAttemptCount() >= MAX_ATTEMPTS) {
+            throw new IllegalStateException("Retry attempts exhausted");
+        }
+
+        // 5. 다음 발송 회차
+        int nextAttempt = delivery.getAttemptCount() + 1;
+
+        // 6. 상태 복구
+        delivery.returnToPending();
+
+        // 7. Retry용 Outbox 저장
+        OutboxEvent event = new OutboxEvent(
+                UUID.randomUUID().toString(),
+                notificationId,
+                deliveryId,
+                delivery.getChannel(),
+                delivery.getDestination(),
+                nextAttempt,
+                OutboxRoute.RETRY
+        );
+
+        outboxEventRepository.save(event);
     }
 
     @Transactional
-    public void recordSuccess(Long notificationId, Long deliveryId) {
+    public void recordSuccess(Long notificationId, Long deliveryId, String token) {
         Notification notification = notificationRepository.findByIdForUpdate(notificationId)
                 .orElseThrow(() -> new IllegalArgumentException("알림을 찾을 수 없습니다."));
 
         NotificationDelivery delivery = deliveryRepository.findById(deliveryId)
                 .orElseThrow(() -> new IllegalArgumentException("전송 정보를 찾을 수 없습니다."));
 
-        if (delivery.getStatus() != DeliveryStatus.PENDING) {
+        if (!delivery.isClaimedBy(token)) {
             return;
         }
 
-        delivery.recordAttempt();
         delivery.markSent();
 
         updateNotificationStatus(notificationId, notification);
     }
 
     @Transactional
-    public void recordFinalFailure(Long notificationId, Long deliveryId) {
-        Notification notification = notificationRepository.findByIdForUpdate(notificationId)
-                .orElseThrow(() -> new IllegalArgumentException("알림을 찾을 수 없습니다."));
+    public void recordFinalFailureAndEnqueue(
+            Long notificationId,
+            Long deliveryId,
+            String token
+    ) {
+        // 1. Notification 먼저 잠금
+        Notification notification = notificationRepository
+                .findByIdForUpdate(notificationId)
+                .orElseThrow();
 
-        NotificationDelivery delivery = deliveryRepository.findById(deliveryId)
-                .orElseThrow(() -> new IllegalArgumentException("전송 정보를 찾을 수 없습니다."));
+        // 2. Delivery 잠금
+        NotificationDelivery delivery = deliveryRepository
+                .findByIdForUpdate(deliveryId)
+                .orElseThrow();
 
-        if (delivery.getStatus() != DeliveryStatus.PENDING) {
+        // 3. 실제 선점자 확인
+        if (!delivery.isClaimedBy(token)) {
             return;
         }
 
-        delivery.recordAttempt();
+        // 4. 최종 시도인지 검증
+        if (delivery.getAttemptCount() != MAX_ATTEMPTS) {
+            throw new IllegalStateException(
+                    "Final failure before max attempts"
+            );
+        }
+
+        // 5. 최종 실패 처리
         delivery.markFailed();
 
+        // 6. Notification 전체 상태 갱신
         updateNotificationStatus(notificationId, notification);
+
+        // 7. DLQ 발행을 위한 Outbox 저장
+        OutboxEvent event = new OutboxEvent(
+                UUID.randomUUID().toString(),
+                notificationId,
+                deliveryId,
+                delivery.getChannel(),
+                delivery.getDestination(),
+                delivery.getAttemptCount(),
+                OutboxRoute.DLQ
+        );
+
+        outboxEventRepository.save(event);
     }
 
     private void updateNotificationStatus(Long notificationId, Notification notification) {
@@ -266,4 +364,10 @@ public class NotificationTransactionService {
                     );
                 });
     }
+
+    public record DeliveryClaim(
+            String token,
+            int attempt
+    ) {}
+
 }

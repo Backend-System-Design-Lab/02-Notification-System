@@ -10,6 +10,8 @@ import com.backendsystemdesignlab.notification.ratelimit.ThrottlePublisher;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
+import java.util.Optional;
+
 @Service
 @RequiredArgsConstructor
 public class DeliveryMessageHandler {
@@ -20,7 +22,6 @@ public class DeliveryMessageHandler {
     private final SmsProvider smsProvider;
     private final EmailProvider emailProvider;
 
-    private final DeliveryRetryPublisher retryPublisher;
     private final NotificationTransactionService transactionService;
 
     private final NotificationRateLimiter rateLimiter;
@@ -35,22 +36,37 @@ public class DeliveryMessageHandler {
             return;
         }
 
+        Optional<NotificationTransactionService.DeliveryClaim> claimed =
+                transactionService.tryClaim(
+                        message.deliveryId(),
+                        message.attempt()
+                );
+
+        if (claimed.isEmpty()) {
+            return;
+        }
+
+        var claim = claimed.get();
+        String token = claim.token();
+        int attempt = claim.attempt();
+
         boolean success = send(message);
 
         if (success) {
-            transactionService.recordSuccess(message.notificationId(), message.deliveryId());
+            transactionService.recordSuccess(message.notificationId(), message.deliveryId(), token);
             return;
         }
 
-        if (message.attempt() < MAX_ATTEMPTS) {
-            DeliveryMessage retryMessage = message.nextAttempt();
-            retryPublisher.publishRetry(retryMessage);
-            transactionService.recordRetryFailure(message.deliveryId());
+        if (attempt < MAX_ATTEMPTS) {
+            transactionService.recordRetryFailureAndEnqueue(
+                    message.notificationId(),
+                    message.deliveryId(),
+                    token
+            );
             return;
         }
 
-        retryPublisher.publishDlq(message);
-        transactionService.recordFinalFailure(message.notificationId(), message.deliveryId());
+        transactionService.recordFinalFailureAndEnqueue(message.notificationId(), message.deliveryId(), token);
     }
 
     private boolean send(DeliveryMessage message) {
