@@ -55,7 +55,7 @@ Synchronous Provider Call
 
 ## 아키텍처
 
-현재 구현에서는 Notification API와 RabbitMQ Consumer가 동일한 Spring Boot Application에서 실행됩니다.
+현재 구현에서는 API와 Outbox Publisher를 app 프로세스에서, RabbitMQ Consumer와 장애 복구 스케줄러를 worker 프로세스에서 실행합니다.
 ```text
                   Internal Service
                          │
@@ -179,6 +179,19 @@ PUBLISHED
 
 RabbitMQ 장애 시 `PENDING` 상태를 유지하고 복구 후 다시 발행합니다.
 
+### Worker 장애 자동 복구
+
+- MySQL 조건부 UPDATE로 Delivery 원자적 선점
+- Processing Token으로 오래된 처리 결과의 DB 반영 방지
+- 최대 3회 발송 시도 제한
+- Retry 및 DLQ 발행을 Transactional Outbox로 처리
+- Worker에서 30초마다 5분 이상 PROCESSING 상태인 Delivery 탐색
+- 만료된 Delivery를 재시도하거나 최종 실패로 전환
+- 동시 처리, 장애 복구 및 Outbox 통합 테스트 작성
+
+스케줄러의 주기적 실행과 실제 Worker 장애 이후 RabbitMQ 재발행까지의 전체 흐름은 별도 운영 검증이 필요합니다.
+외부 Provider까지 포함한 Exactly-once 발송은 보장하지 않습니다.
+
 ### At-least-once + Idempotency
 
 외부 Provider까지 포함한 Exactly-once 대시    
@@ -242,7 +255,6 @@ curl -X PATCH \
 | [추가 실험](docs/06-additional-experiments.md) | API/Worker 분리, 장애 격리 및 성능 비교 |
 ## 후속 과제
 
-* API와 Consumer Worker 분리
 * 채널별 Worker 독립 수평 확장
 * RabbitMQ Cluster 구성
 * MySQL Replica / Failover
