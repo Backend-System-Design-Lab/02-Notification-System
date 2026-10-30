@@ -45,3 +45,10 @@ out/
 # Build and IDE
 .gradle/
 .idea/
+
+# 로컬 성능 실험 결과 및 DB 백업
+/backup-notification-*.sql
+/experiments/**/*.sql
+/experiments/api-worker-isolation/*.txt
+/result*.txt
+/hikari*.txt

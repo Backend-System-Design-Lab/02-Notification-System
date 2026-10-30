@@ -68,12 +68,16 @@ mock:
     force-failure: ${MOCK_PROVIDER_FORCE_FAILURE:false}
     fail-first-attempts: ${MOCK_PROVIDER_FAIL_FIRST_ATTEMPTS:0}
 
-outbox:
-  publish-interval-ms: ${OUTBOX_PUBLISH_INTERVAL_MS:1000}
-
 
 notification:
   rate-limit:
     push: ${PUSH_RATE_LIMIT:100}
     sms: ${SMS_RATE_LIMIT:20}
     email: ${EMAIL_RATE_LIMIT:50}
+  consumer:
+    enabled: ${NOTIFICATION_CONSUMER_ENABLED:true}
+
+outbox:
+  publish-interval-ms: ${OUTBOX_PUBLISH_INTERVAL_MS:1000}
+  publisher:
+    enabled: ${OUTBOX_PUBLISHER_ENABLED:true}

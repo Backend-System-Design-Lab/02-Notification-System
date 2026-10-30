@@ -27,6 +27,9 @@ services:
       SPRING_DATA_REDIS_HOST: redis
       SPRING_DATA_REDIS_PORT: 6379
 
+      NOTIFICATION_CONSUMER_ENABLED: "false"
+      OUTBOX_PUBLISHER_ENABLED: "true"
+
     healthcheck:
       test:
         - CMD
@@ -140,6 +143,39 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  worker:
+    image: notification-system:local
+
+    environment:
+      APP_NAME: notification-worker
+      VIRTUAL_THREADS_ENABLED: "false"
+
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/notification
+      SPRING_DATASOURCE_USERNAME: notification
+      SPRING_DATASOURCE_PASSWORD: notification
+
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: notification
+      SPRING_RABBITMQ_PASSWORD: notification
+
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+
+      NOTIFICATION_CONSUMER_ENABLED: "true"
+      OUTBOX_PUBLISHER_ENABLED: "false"
+
+      NOTIFICATION_CONSUMER_CONCURRENCY: 5
+      RABBITMQ_PREFETCH: 50
+
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 volumes:
   prometheus-data:

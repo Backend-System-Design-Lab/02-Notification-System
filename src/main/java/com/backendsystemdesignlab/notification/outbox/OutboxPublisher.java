@@ -7,6 +7,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -16,12 +17,17 @@ import java.util.concurrent.TimeoutException;
 
 @Slf4j
 @Component
+@ConditionalOnProperty(
+        prefix = "outbox.publisher",
+        name = "enabled",
+        havingValue = "true",
+        matchIfMissing = true
+)
 @RequiredArgsConstructor
 public class OutboxPublisher {
 
     private final OutboxTransactionService transactionService;
     private final RabbitTemplate rabbitTemplate;
-    private final NotificationTransactionService notificationTransactionService;
     private final OutboxFailureService failureService;
 
     // DB Connection 없음 (RabbitMQ가 DB를 잡고 있지 않게)

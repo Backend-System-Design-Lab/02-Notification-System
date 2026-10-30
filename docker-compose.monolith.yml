@@ -1,0 +1,5 @@
+services:
+  app:
+    environment:
+      NOTIFICATION_CONSUMER_ENABLED: "true"
+      OUTBOX_PUBLISHER_ENABLED: "true"

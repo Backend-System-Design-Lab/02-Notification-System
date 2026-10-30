@@ -232,13 +232,14 @@ curl -X PATCH \
 
 ## 문서
 
-| 문서 | 내용 |
-|---|---|
-| [Requirements](docs/01-requirements.md) | 범위와 성공 기준 |
-| [Capacity](docs/02-capacity-estimation.md) | 트래픽, 저장량, 예상 병목 |
-| [Architecture](docs/03-architecture.md) | 최종 구조와 설계 판단 |
-| [Experiment](docs/04-experiment.md) | 부하, 병목, 장애 실험 결과 |
-| [Retrospective](docs/05-retrospective.md) | 문제 해결 과정과 면접용 정리 |
+| 문서                                                        | 내용 |
+|-----------------------------------------------------------|---|
+| [Requirements](docs/01-requirements.md)                   | 범위와 성공 기준 |
+| [Capacity](docs/02-capacity-estimation.md)                | 트래픽, 저장량, 예상 병목 |
+| [Architecture](docs/03-architecture.md)                   | 최종 구조와 설계 판단 |
+| [Experiment](docs/04-experiment.md)                       | 부하, 병목, 장애 실험 결과 |
+| [Retrospective](docs/05-retrospective.md)                 | 문제 해결 과정과 면접용 정리 |
+| [API/Worker Isolation](docs/06-additional-experiments.md) | 실행 환경 분리, 장애 격리 및 성능 비교 |
 
 ## 후속 과제
 
