@@ -185,6 +185,32 @@ elif [[ "$MODE" == "worker-idle" ]]; then
   fi
 fi
 
+
+capture_diag() {
+  local phase="$1"
+  local prefix="$DIR/${MODE}-${RUN_ID}-diag-${phase}"
+
+  # MySQL 전체 행 잠금 지표
+  dc exec -T mysql mysql -N -B     -unotification -pnotification     -e "SHOW GLOBAL STATUS WHERE Variable_name IN (
+      'Innodb_row_lock_waits',
+      'Innodb_row_lock_time',
+      'Innodb_row_lock_current_waits',
+      'Innodb_log_waits'
+    );" > "${prefix}-mysql.txt" 2>/dev/null || true
+
+  # JVM 및 HikariCP 지표
+  for service in app worker; do
+    if [[ "$service" == "worker" && "$MODE" != "separated" ]]; then
+      continue
+    fi
+
+    for metric in       jvm.gc.pause       process.cpu.time       hikaricp.connections.acquire       hikaricp.connections.usage
+    do
+      dc exec -T "$service"         curl -fsS --max-time 3         "http://localhost:8080/actuator/metrics/$metric"         > "${prefix}-${service}-${metric}.json" 2>/dev/null ||         echo '{}' > "${prefix}-${service}-${metric}.json"
+    done
+  done
+}
+
 echo "[7] Start HikariCP monitoring"
 
 (
@@ -241,6 +267,8 @@ STATS_PID=$!
 
 trap 'kill "$MONITOR_PID" "$STATS_PID" 2>/dev/null || true' EXIT
 
+capture_diag before
+
 echo "[8] Run k6 benchmark"
 
 if [[ "${LOAD_MODE:-vus}" == "arrival" ]]; then
@@ -255,6 +283,8 @@ else
     /scripts/notification-async.js \
     2>&1 | tee "$DIR/${MODE}-${RUN_ID}-k6.txt"
 fi
+
+capture_diag after
 
 kill "$MONITOR_PID" "$STATS_PID" 2>/dev/null || true
 wait "$MONITOR_PID" "$STATS_PID" 2>/dev/null || true

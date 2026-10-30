@@ -53,3 +53,6 @@ out/
 /result*.txt
 /hikari*.txt
 
+
+# Local benchmark diagnostics
+/experiments/api-worker-isolation/*-diag-*.json

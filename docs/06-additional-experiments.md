@@ -2,29 +2,29 @@
 
 ## 1. 배경 및 설계
 
-기존에는 하나의 Spring Boot JVM에서 HTTP API, Outbox Publisher, RabbitMQ Consumer를 실행했다. Consumer 장애가 API에 미치는 영향을 줄이기 위해 API와 Worker를 별도 프로세스로 분리했다.
+기존 단일 Spring Boot JVM에서 실행하던 API, Outbox Publisher, RabbitMQ Consumer를 API와 Worker 프로세스로 분리했다.
 
 | 구성 | API App | Worker |
 |---|---|---|
 | 기존 | API + Publisher + Consumer | 없음 |
 | 변경 | API + Publisher | Consumer |
 
-- 동일한 Docker 이미지 사용, 환경 변수로 실행 역할 제어
+- 동일 Docker 이미지 사용, 환경 변수로 실행 역할 제어
 - JVM 및 HikariCP Connection Pool 독립화
 - MySQL, Redis, RabbitMQ는 공유
 - 동일 Docker 호스트의 8 CPU 환경에서 검증
 
+**목표:** 처리량 향상보다 Worker 장애 시 API 접수 유지 및 독립적인 복구 가능성 검증
+
 ## 2. 장애 격리 검증
 
-Worker 중단 상태에서 **2 VU, 10초 동안 2,657건의 API 요청을 모두 HTTP 202로 접수**했다.
+Worker 중단 상태에서 **2 VU, 10초 동안 2,657건의 요청을 모두 HTTP 202로 접수**했다. Worker 재시작 후 적체된 메시지의 처리 재개도 확인했다.
 
-Worker 재시작 후 적체된 메시지의 처리 재개도 확인했다.
-
-**결과:** Worker의 독립적인 중단 및 복구가 가능하고, Worker 장애 중에도 API 요청 접수를 유지할 수 있음을 검증했다.
+**결과:** Worker 장애 중에도 API 요청 접수를 유지하고, 독립적인 재시작 및 처리가 가능함을 검증했다.
 
 ## 3. 정상 부하 성능 비교
 
-**조건:** 50 VU, 15초, 구조별 2회. DB, RabbitMQ, Redis 초기화 및 JVM 워밍업 후 측정.
+**조건:** 50 VU, 15초, 구조별 2회 측정. 테스트 데이터 초기화 및 워밍업 후 실행.
 
 | 지표 | 단일 App | 분리 구조 |
 |---|---:|---:|
@@ -32,38 +32,52 @@ Worker 재시작 후 적체된 메시지의 처리 재개도 확인했다.
 | 평균 p95 | **222.28ms** | 316.09ms |
 | HTTP 실패율 | 0% | 0% |
 
-정상 부하에서는 단일 App이 더 높은 API 접수 처리량을 기록했다. 분리 구조의 성능 개선은 확인되지 않았다.
+단일 App이 더 높은 API 접수 처리량을 기록했으며, 프로세스 분리에 따른 성능 개선은 확인되지 않았다.
 
 ## 4. 성능 저하 원인 분석
 
-요청 완료 속도에 따른 부하 차이를 제거하기 위해 **200 RPS, 30초**의 고정 요청률로 네 가지 구성을 비교했다.
+### 4.1 고정 요청률 실험
+
+**조건:** 200 RPS, 30초, 각 구성 1회 측정.
 
 | 구성 | API p95 | 평균 API Pending |
 |---|---:|---:|
 | 단일 App | 54.19ms | 1.80 |
 | API / Worker 분리 | 104.58ms | 1.45 |
-| API 단독 (Worker 중단) | **31.07ms** | **0.28** |
-| Worker Idle (Consumer 비활성화) | 65.93ms | 0.86 |
+| API 단독 | **31.07ms** | **0.28** |
+| Worker Idle | 65.93ms | 0.86 |
 
-모든 구성에서 약 6,000건을 처리했으며 HTTP 실패율은 0%였다.
+Worker 중단 시 API 지연이 감소했고, Consumer를 비활성화한 Worker JVM만 실행해도 지연이 증가했다. 반면 HikariCP Pending 개수만으로는 구조별 성능 차이를 설명하기 어려웠다.
 
-**분석 결과**
+### 4.2 Consumer 동시성 및 DB 경합 분석
 
-- Worker 중단 시 API 지연 감소: Consumer 처리 작업에 따른 공유 자원 경합 가능성
-- Worker Idle에서도 지연 증가: 추가 JVM의 실행 비용 또는 환경 영향 가능성
-- 단일 App과 분리 구조의 API Pending 유사: Connection Pool 대기 개수만으로 성능 차이 설명 불가
-- CPU, GC, DB 잠금 및 쿼리 수행시간에 대한 추가 계측이 없어 정확한 원인과 기여도는 확정하지 못함
+분리 구조에서 Consumer Concurrency를 5에서 1로 변경하고 동일한 200 RPS, 30초 부하를 적용했다.
 
-각 고정 요청률 실험은 1회 측정이며, Consumer 비활성화 구성에서는 실제 발송이 이루어지지 않으므로 전체 알림 처리 성능과 직접 비교할 수 없다.
+| 지표 | Concurrency 5 | Concurrency 1 |
+|---|---:|---:|
+| API p95 | 165.38ms | **52.88ms** |
+| Connection 획득 평균 | 14.231ms | **1.255ms** |
+| Connection 사용 평균 | 13.084ms | **8.257ms** |
+| MySQL 행 잠금 대기 횟수 | 299회 | **2회** |
+| MySQL 행 잠금 총 대기시간 | 3,183ms | **14ms** |
+| HTTP 실패율 | 0% | 0% |
 
-## 5. 결론 및 후속 과제
+Consumer 동시성을 낮추자 MySQL 행 잠금 대기와 API의 DB Connection 획득 시간이 함께 감소했고, **API p95는 약 68% 개선**됐다.
 
-**설계 판단:** API/Worker 분리는 정상 상태의 처리량 개선보다 장애 격리와 독립적인 실행 및 복구에 의미가 있었다.
+이는 Consumer의 동시 DB 작업이 공유 MySQL의 경합과 API 지연에 기여했을 가능성을 뒷받침한다. GC 정지시간은 분리 구조의 API JVM에서 증가하지 않아 주요 원인으로 볼 근거가 부족했다.
 
-다만 동일 호스트에서 프로세스 추가에 따른 운영 비용과 API 응답 지연이 관측됐으므로, 운영 환경 적용 여부는 추가 검증이 필요하다.
+단, MySQL 잠금 지표는 서버 전체 기준이며, Consumer 동시성 변경에 따라 발송 처리량과 메시지 적체량도 달라진다. 각 조건의 반복 측정도 부족하므로 정확한 인과관계와 최적 동시성은 확정하지 않았다.
 
-**후속 과제:** Consumer 고부하 격리 검증, JVM 및 DB 병목 분석, 동시 중복 메시지 처리 방지.
+## 5. 결론
+
+**API / Worker 분리는 성능 최적화보다 장애 격리 목적에서 유효한 설계였다.**
+
+- Worker 독립 중단 및 재시작, API 요청 접수 유지 확인
+- 분리 구조에서 API 성능 저하 관측
+- Consumer 동시성 조절로 DB 경합과 API 지연이 함께 감소하는 현상 확인
+
+**후속 과제:** Worker 처리량과 Queue 적체 측정, 동시 중복 메시지 처리 방지.
 
 **재현:** `experiments/api-worker-isolation/benchmark.sh`
 
-측정값은 로컬 Mock Provider 및 테스트 환경에 한정하며, HTTP 202는 알림 발송 완료가 아닌 접수 성공을 의미한다.
+모든 결과는 로컬 Mock Provider 환경에 한정되며, HTTP 202는 알림 발송 완료가 아닌 접수 성공을 의미한다.
