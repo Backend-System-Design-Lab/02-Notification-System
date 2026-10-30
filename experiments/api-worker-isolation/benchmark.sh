@@ -3,7 +3,7 @@ set -euo pipefail
 
 MODE="${1:-}"
 
-if [[ "$MODE" != "monolith" && "$MODE" != "separated" ]]; then
+if [[ "$MODE" != "monolith" && "$MODE" != "separated" && "$MODE" != "api-only" && "$MODE" != "worker-idle" ]]; then
   echo "Usage: $0 monolith|separated"
   exit 1
 fi
@@ -142,7 +142,7 @@ fi
 
 wait_ready app
 
-if [[ "$MODE" == "separated" ]]; then
+if [[ "$MODE" != "monolith" ]]; then
   wait_ready worker
 fi
 
@@ -162,12 +162,35 @@ wait_drained
 echo "[6] Reset warmup data"
 reset_data
 
+if [[ "$MODE" == "api-only" ]]; then
+  echo "[DIAGNOSTIC] Stop Worker"
+  dc stop worker
+elif [[ "$MODE" == "worker-idle" ]]; then
+  echo "[DIAGNOSTIC] Recreate Worker without consumers"
+
+  docker compose \
+    -f docker-compose.yml \
+    -f docker-compose.worker-idle.yml \
+    up -d --no-deps --force-recreate worker
+
+  wait_ready worker
+  sleep 30
+
+  enabled=$(dc exec -T worker printenv \
+    NOTIFICATION_CONSUMER_ENABLED | tr -d '\r')
+
+  if [[ "$enabled" != "false" ]]; then
+    echo "[ERROR] Worker consumer is still enabled"
+    exit 1
+  fi
+fi
+
 echo "[7] Start HikariCP monitoring"
 
 (
   while true; do
     for metric_service in app worker; do
-      if [[ "$MODE" == "monolith" &&
+      if [[ "$MODE" != "separated" && "$MODE" != "worker-idle" &&
             "$metric_service" == "worker" ]]; then
         continue
       fi
@@ -190,20 +213,54 @@ echo "[7] Start HikariCP monitoring"
 
 MONITOR_PID=$!
 
-trap 'kill "$MONITOR_PID" 2>/dev/null || true' EXIT
+# k6 측정 구간의 컨테이너 자원 사용량 기록
+RESOURCE_CONTAINERS=(
+  02-notification-system-app-1
+  02-notification-system-mysql-1
+  02-notification-system-redis-1
+  notification-rabbitmq
+)
+
+if [[ "$MODE" == "separated" || "$MODE" == "worker-idle" ]]; then
+  RESOURCE_CONTAINERS+=(02-notification-system-worker-1)
+fi
+
+(
+  while true; do
+    echo "===== $(date '+%H:%M:%S') ====="
+
+    docker stats --no-stream \
+      --format '{{.Name}} CPU={{.CPUPerc}} MEM={{.MemUsage}}' \
+      "${RESOURCE_CONTAINERS[@]}" 2>/dev/null || true
+
+    sleep 1
+  done
+) > "$DIR/${MODE}-${RUN_ID}-resources.txt" &
+
+STATS_PID=$!
+
+trap 'kill "$MONITOR_PID" "$STATS_PID" 2>/dev/null || true' EXIT
 
 echo "[8] Run k6 benchmark"
 
-dc run --rm --no-deps k6 run \
-  --vus 50 \
-  --duration 15s \
-  /scripts/notification-async.js \
-  2>&1 | tee "$DIR/${MODE}-${RUN_ID}-k6.txt"
+if [[ "${LOAD_MODE:-vus}" == "arrival" ]]; then
+  dc run --rm --no-deps k6 run \
+    -e RATE="${RATE:-200}" \
+    /scripts/notification-fixed-rate.js \
+    2>&1 | tee "$DIR/${MODE}-${RUN_ID}-k6-arrival.txt"
+else
+  dc run --rm --no-deps k6 run \
+    --vus 50 \
+    --duration 15s \
+    /scripts/notification-async.js \
+    2>&1 | tee "$DIR/${MODE}-${RUN_ID}-k6.txt"
+fi
 
-kill "$MONITOR_PID" 2>/dev/null || true
-wait "$MONITOR_PID" 2>/dev/null || true
+kill "$MONITOR_PID" "$STATS_PID" 2>/dev/null || true
+wait "$MONITOR_PID" "$STATS_PID" 2>/dev/null || true
 
 trap - EXIT
 
 echo "===== FINISHED: $MODE ====="
 echo "Results: $DIR"
+

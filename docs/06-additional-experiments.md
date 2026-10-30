@@ -1,130 +1,69 @@
 # API / Worker 실행 환경 분리 및 검증
 
-## 1. 배경과 목표
+## 1. 배경 및 설계
 
-기존 알림 시스템은 하나의 Spring Boot JVM에서 HTTP API, Transactional Outbox Publisher, RabbitMQ Consumer를 모두 실행했다. Consumer 지연이나 재시작이 API 요청 접수에 미치는 영향을 줄이고, API와 Consumer의 JVM 및 HikariCP Connection Pool을 분리하기 위해 실행 역할을 나누었다.
+기존에는 하나의 Spring Boot JVM에서 HTTP API, Outbox Publisher, RabbitMQ Consumer를 실행했다. Consumer 장애가 API에 미치는 영향을 줄이기 위해 API와 Worker를 별도 프로세스로 분리했다.
 
-**주요 목표:** API RPS 극대화가 아니라 Consumer 장애 시 요청 접수 유지, 별도 프로세스 재시작 및 자원 격리 가능성 검증.
+| 구성 | API App | Worker |
+|---|---|---|
+| 기존 | API + Publisher + Consumer | 없음 |
+| 변경 | API + Publisher | Consumer |
 
-## 2. 아키텍처 변경
+- 동일한 Docker 이미지 사용, 환경 변수로 실행 역할 제어
+- JVM 및 HikariCP Connection Pool 독립화
+- MySQL, Redis, RabbitMQ는 공유
+- 동일 Docker 호스트의 8 CPU 환경에서 검증
 
-### 기존: 단일 프로세스
+## 2. 장애 격리 검증
 
-```text
-Spring Boot App (JVM 1개, HikariCP Pool 1개)
-  ├─ Notification HTTP API
-  ├─ Outbox Publisher
-  └─ RabbitMQ Consumer (PUSH, SMS, EMAIL)
-       └─ Mock Provider
+Worker 중단 상태에서 **2 VU, 10초 동안 2,657건의 API 요청을 모두 HTTP 202로 접수**했다.
 
-Shared Infrastructure: MySQL / Redis / RabbitMQ
-```
+Worker 재시작 후 적체된 메시지의 처리 재개도 확인했다.
 
-### 변경: 2개 프로세스
+**결과:** Worker의 독립적인 중단 및 복구가 가능하고, Worker 장애 중에도 API 요청 접수를 유지할 수 있음을 검증했다.
 
-```text
-API App (JVM 1, HikariCP Pool 1)
-  ├─ Notification HTTP API
-  └─ Outbox Publisher
-          │
-          ▼
-       RabbitMQ
-          │
-          ▼
-Worker App (JVM 2, HikariCP Pool 2)
-  └─ RabbitMQ Consumer (PUSH, SMS, EMAIL)
-       └─ Mock Provider
+## 3. 정상 부하 성능 비교
 
-Shared Infrastructure: MySQL / Redis / RabbitMQ
-```
+**조건:** 50 VU, 15초, 구조별 2회. DB, RabbitMQ, Redis 초기화 및 JVM 워밍업 후 측정.
 
-동일 Docker 이미지를 재사용하되 실행 환경 변수로 각 프로세스의 역할을 제어했다.
+| 지표 | 단일 App | 분리 구조 |
+|---|---:|---:|
+| 평균 RPS | **458.22** | 335.45 |
+| 평균 p95 | **222.28ms** | 316.09ms |
+| HTTP 실패율 | 0% | 0% |
 
-| 역할 | `NOTIFICATION_CONSUMER_ENABLED` | `OUTBOX_PUBLISHER_ENABLED` |
-| --- | --- | --- |
-| 단일 App | `true` | `true` |
-| API App | `false` | `true` |
-| Worker | `true` | `false` |
+정상 부하에서는 단일 App이 더 높은 API 접수 처리량을 기록했다. 분리 구조의 성능 개선은 확인되지 않았다.
 
-> 두 컨테이너는 같은 Docker 호스트에서 실행한다. 물리 서버가 분리된 것은 아니며 MySQL, Redis, RabbitMQ도 공유한다. API와 Publisher는 여전히 같은 JVM에서 실행한다.
+## 4. 성능 저하 원인 분석
 
-## 3. 장애 격리 실험
+요청 완료 속도에 따른 부하 차이를 제거하기 위해 **200 RPS, 30초**의 고정 요청률로 네 가지 구성을 비교했다.
 
-- Worker 컨테이너를 중지하고 API에 요청을 가했다.
-- **2 VU, 10초:** 2,657건의 HTTP 202 수락, 요청 실패율 0%.
-- Worker가 중지된 상태에서도 API는 Notification과 Outbox 저장을 계속 수행할 수 있었다.
-- Worker 재시작 후 Consumer가 Queue에 다시 연결되고 적체된 메시지를 처리하는 것을 확인했다.
-- 별도의 50 VU 실험에서는 Outbox 36,432건이 모두 `PUBLISHED`, Delivery 36,432건이 모두 `SENT`로 전환되는 것을 확인했다.
+| 구성 | API p95 | 평균 API Pending |
+|---|---:|---:|
+| 단일 App | 54.19ms | 1.80 |
+| API / Worker 분리 | 104.58ms | 1.45 |
+| API 단독 (Worker 중단) | **31.07ms** | **0.28** |
+| Worker Idle (Consumer 비활성화) | 65.93ms | 0.86 |
 
-**해석:** Worker 프로세스를 중지하더라도 API 접수와 재시작 후 처리 재개가 가능했다. 다만 이는 Mock Provider 및 단일 로컬 Docker 호스트 환경의 검증이며, 물리 장애, MySQL 장애, 실제 외부 Provider의 최종 도달을 보장하지 않는다.
+모든 구성에서 약 6,000건을 처리했으며 HTTP 실패율은 0%였다.
 
-## 4. 정상 부하 성능 비교
+**분석 결과**
 
-### 실험 조건
+- Worker 중단 시 API 지연 감소: Consumer 처리 작업에 따른 공유 자원 경합 가능성
+- Worker Idle에서도 지연 증가: 추가 JVM의 실행 비용 또는 환경 영향 가능성
+- 단일 App과 분리 구조의 API Pending 유사: Connection Pool 대기 개수만으로 성능 차이 설명 불가
+- CPU, GC, DB 잠금 및 쿼리 수행시간에 대한 추가 계측이 없어 정확한 원인과 기여도는 확정하지 못함
 
-- k6: **50 VU, 15초**, 요청별 고유 `eventId`, 응답 코드 202 확인.
-- 요청: `POST /api/v1/notifications`, `PUSH`, `SMS`, `EMAIL` 채널.
-- 각 측정 전 Notification / Delivery / Outbox 테스트 데이터, RabbitMQ 관련 Queue, 전용 Redis 테스트 DB 초기화.
-- 컨테이너 재생성, Actuator 준비 상태 확인, 1 VU × 5초 API 워밍업, 워밍업 메시지 처리 완료 확인 후 재초기화.
-- 측정 스크립트: `experiments/api-worker-isolation/benchmark.sh`.
-- 실행 순서: 단일 → 분리 → 분리 → 단일.
+각 고정 요청률 실험은 1회 측정이며, Consumer 비활성화 구성에서는 실제 발송이 이루어지지 않으므로 전체 알림 처리 성능과 직접 비교할 수 없다.
 
-### 측정 결과
+## 5. 결론 및 후속 과제
 
-| 구분 | 단일 App RPS | 분리 구조 RPS | 단일 App p95 | 분리 구조 p95 |
-| --- | ---: | ---: | ---: | ---: |
-| 1차 | 418.14 | 286.11 | 254.49 ms | 387.21 ms |
-| 2차 | 498.30 | 384.78 | 190.07 ms | 244.97 ms |
-| 산술평균 (참고) | **458.22** | **335.45** | **222.28 ms** | **316.09 ms** |
+**설계 판단:** API/Worker 분리는 정상 상태의 처리량 개선보다 장애 격리와 독립적인 실행 및 복구에 의미가 있었다.
 
-- 두 반복 측정 모두 단일 App의 API RPS와 p95가 우세했다.
-- **분리 구조의 정상 상태 처리량 향상은 확인되지 않았다.**
-- `HTTP 202`는 비동기 작업의 **접수 성공**을 의미하며 최종 Provider 발송 완료와 다르다.
-- 실행별 편차가 존재했고, 반복 횟수 2회 및 측정 시간 15초라는 한계가 있다. 위 차이를 운영 환경의 성능 개선 또는 저하율로 일반화하지 않는다.
+다만 동일 호스트에서 프로세스 추가에 따른 운영 비용과 API 응답 지연이 관측됐으므로, 운영 환경 적용 여부는 추가 검증이 필요하다.
 
-### HikariCP 관측
+**후속 과제:** Consumer 고부하 격리 검증, JVM 및 DB 병목 분석, 동시 중복 메시지 처리 방지.
 
-| 실행 구조 | API Pool 최대 Pending | Worker Pool 최대 Pending |
-| --- | ---: | ---: |
-| 단일 App | 42 | 별도 Pool 없음 |
-| 분리 구조 | 41 | 0 |
+**재현:** `experiments/api-worker-isolation/benchmark.sh`
 
-- 위 값은 1차 실험의 샘플링된 최댓값이며 장시간 최대치나 평균이 아니다.
-- Consumer를 분리했어도 API 프로세스의 커넥션 대기는 상당했다.
-- API의 Notification, Delivery, Outbox 저장 작업과 동일 JVM의 Publisher가 경합 원인 후보이나, **원인은 확정하지 않았다**.
-
-## 5. 결과 해석 및 트레이드오프
-
-### 얻은 것
-
-- Consumer를 독립적으로 중지하고 재시작하는 실행 단위 확보.
-- API와 Worker의 JVM 및 HikariCP Pool 독립화.
-- Worker 일시 중단 시 요청 접수 유지와 복구 후 발송 처리 재개 확인.
-
-### 비용 및 한계
-
-- 동일 로컬 호스트에 JVM이 추가되어 CPU, 메모리, GC 부하가 늘어날 수 있음. CPU, 메모리, GC 계측을 하지 않아 성능 차이의 원인으로 단정하지 않음.
-- MySQL 등 공유 인프라의 장애는 여전히 API와 Worker 모두에 영향을 줄 수 있음.
-- API와 Publisher는 한 프로세스이므로 API Pool의 커넥션 경합이 남아 있음.
-- 별도 Outbox Publisher 프로세스를 추가하면 역할 격리는 강화되지만 순차 발행 병목이 자동으로 해결되는 것은 아님.
-
-**설계 결론:** 현 시점에서 2프로세스 구조를 *정상 상태 RPS 개선*의 근거로 주장하지 않는다. 분리의 근거는 Worker의 독립 중단, 복구 및 장애 영향 범위 축소이며, 운영 비용에 비해 가치가 있는지는 추가 부하 격리 실험이 필요하다.
-
-## 6. 남은 검증 과제
-
-1. **Consumer 고부하 격리 실험:** Consumer 부하를 통제하여 단일 App과 분리 구조의 API p95 및 HikariCP 경합 비교.
-2. **자원 계측:** Docker 컨테이너별 CPU 및 메모리, JVM GC, DB 커넥션 획득 대기 시간 분석.
-3. **처리 완료 지표:** HTTP 202 접수 RPS와 별개로 Outbox 적체, RabbitMQ Queue Lag, Delivery 완료 지연 측정.
-4. **동시 중복 처리:** 동일 Delivery 메시지의 병렬 소비에서 외부 Provider 중복 호출 가능성 재현 및 선점/복구 설계.
-5. **3프로세스 분리 여부:** Publisher가 API 경합의 원인으로 확인된 경우에만 API / Publisher / Worker 분리 검토.
-
-## 7. 재현 명령어
-
-```bash
-# 반드시 이 프로젝트 전용 실험 DB, RabbitMQ, Redis에서만 실행
-# benchmark.sh는 데이터 삭제 및 Queue purge를 수행하므로 실행 전 백업 확인
-./experiments/api-worker-isolation/benchmark.sh monolith
-./experiments/api-worker-isolation/benchmark.sh separated
-```
-
-개인정보 또는 테스트 사용자 정보가 포함될 수 있는 SQL 백업은 Git에 포함하지 않는다. k6 및 HikariCP 로그에서 실험별 수치를 검증할 수 있다.
+측정값은 로컬 Mock Provider 및 테스트 환경에 한정하며, HTTP 202는 알림 발송 완료가 아닌 접수 성공을 의미한다.

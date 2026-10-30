@@ -1,0 +1,5 @@
+services:
+  worker:
+    environment:
+      NOTIFICATION_CONSUMER_ENABLED: "false"
+      OUTBOX_PUBLISHER_ENABLED: "false"
